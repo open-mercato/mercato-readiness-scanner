@@ -800,6 +800,100 @@ function escapedIdentifier(identifier: string): string {
   return identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+function singleArrayElement(source: string): string | null {
+  const depths = { brace: 0, bracket: 0, parenthesis: 0 }
+  let quote = ''
+  let escaped = false
+  let separator = -1
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index] ?? ''
+    if (quote) {
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === quote) quote = ''
+      continue
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character
+      continue
+    }
+    if (character === '{') depths.brace += 1
+    else if (character === '}') depths.brace -= 1
+    else if (character === '[') depths.bracket += 1
+    else if (character === ']') depths.bracket -= 1
+    else if (character === '(') depths.parenthesis += 1
+    else if (character === ')') depths.parenthesis -= 1
+    else if (character === ',' && depths.brace === 0 && depths.bracket === 0 && depths.parenthesis === 0) {
+      if (separator >= 0) return null
+      separator = index
+    }
+    if (depths.brace < 0 || depths.bracket < 0 || depths.parenthesis < 0) return null
+  }
+  if (quote || depths.brace !== 0 || depths.bracket !== 0 || depths.parenthesis !== 0) return null
+  if (separator < 0) return source.trim() || null
+  if (source.slice(separator + 1).trim()) return null
+  return source.slice(0, separator).trim() || null
+}
+
+function coercesToHeadersKey(expression: string): boolean {
+  let candidate = expression.trim()
+  while (candidate.startsWith('(')) {
+    const body = extractDelimitedBody(candidate, 0, '(', ')')
+    if (body === null || body.length + 2 !== candidate.length) break
+    candidate = body.trim()
+  }
+  if (/^(?:["']headers["']|`headers`)$/.test(candidate)) return true
+  if (!candidate.startsWith('[')) return false
+  const body = extractDelimitedBody(candidate, 0, '[', ']')
+  if (body === null || body.length + 2 !== candidate.length) return false
+  const element = singleArrayElement(body)
+  return element !== null && coercesToHeadersKey(element)
+}
+
+function callArgument(source: string, start: number): string | null {
+  const depths = { brace: 0, bracket: 0, parenthesis: 0 }
+  let quote = ''
+  let escaped = false
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index] ?? ''
+    if (quote) {
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === quote) quote = ''
+      continue
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character
+      continue
+    }
+    if (character === '{') depths.brace += 1
+    else if (character === '}') depths.brace -= 1
+    else if (character === '[') depths.bracket += 1
+    else if (character === ']') depths.bracket -= 1
+    else if (character === '(') depths.parenthesis += 1
+    else if (character === ')') {
+      if (depths.parenthesis === 0 && depths.brace === 0 && depths.bracket === 0) return null
+      depths.parenthesis -= 1
+    } else if (character === ',' && depths.brace === 0 && depths.bracket === 0 && depths.parenthesis === 0) {
+      return source.slice(start, index).trim() || null
+    }
+    if (depths.brace < 0 || depths.bracket < 0 || depths.parenthesis < 0) return null
+  }
+  return null
+}
+
+function hasCoercedHeaderMutation(source: string, identifier: string): boolean {
+  const identifierPattern = escapedIdentifier(identifier)
+  const patterns = [
+    new RegExp(`\\b(?:Object|Reflect)\\s*\\.\\s*defineProperty\\s*\\(\\s*${identifierPattern}\\s*,\\s*`, 'gm'),
+    new RegExp(`\\bReflect\\s*\\.\\s*set\\s*\\(\\s*${identifierPattern}\\s*,\\s*`, 'gm'),
+  ]
+  return patterns.some((pattern) => [...source.matchAll(pattern)].some((match) => {
+    const argument = callArgument(source, (match.index ?? 0) + match[0].length)
+    return argument !== null && coercesToHeadersKey(argument)
+  }))
+}
+
 function declaredArray(scope: string, identifier: string): string | null {
   const projection = topLevelProjection(scope)
   const pattern = new RegExp(`(?:(?:const|let|var)\\s+|(?:^|[;\\n])\\s*)${escapedIdentifier(identifier)}\\s*=\\s*`, 'gm')
@@ -850,7 +944,7 @@ function exportedConfigObject(source: string): { body: string, start: number } |
     `\\bReflect\\s*\\.\\s*set\\s*\\(\\s*${identifierPattern}\\s*,\\s*${headerKeyPattern}`,
     `\\bObject\\s*\\.\\s*setPrototypeOf\\s*\\(\\s*${identifierPattern}\\b`,
   ].join('|'), 'm')
-  return mutation.test(afterObject) ? null : { body, start: openingBrace }
+  return mutation.test(afterObject) || hasCoercedHeaderMutation(afterObject, identifier) ? null : { body, start: openingBrace }
 }
 
 function activeHeadersBody(configBody: string): string | null {
