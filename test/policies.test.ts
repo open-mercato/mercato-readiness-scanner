@@ -108,6 +108,8 @@ test('counts only active blocking workflow commands as release validation', () =
   const root = makeAppFixture()
   try {
     overwrite(root, '.github/workflows/release.yml', [
+      'on:',
+      '  push:',
       'jobs:',
       '  validate:',
       '    steps:',
@@ -118,6 +120,8 @@ test('counts only active blocking workflow commands as release validation', () =
 
     for (const testCommand of ['yarn test; true', 'yarn test\n          true', 'yarn test | tee test.log']) {
       overwrite(root, '.github/workflows/release.yml', [
+        'on:',
+        '  push:',
         'jobs:',
         '  validate:',
         '    steps:',
@@ -133,6 +137,8 @@ test('counts only active blocking workflow commands as release validation', () =
 
     for (const shell of [null, 'bash -e {0}']) {
       overwrite(root, '.github/workflows/release.yml', [
+        'on:',
+        '  push:',
         'jobs:',
         '  validate:',
         '    steps:',
@@ -145,6 +151,8 @@ test('counts only active blocking workflow commands as release validation', () =
     }
 
     overwrite(root, '.github/workflows/release.yml', [
+      'on:',
+      '  push:',
       'jobs:',
       '  validate:',
       '    steps:',
@@ -156,6 +164,8 @@ test('counts only active blocking workflow commands as release validation', () =
     assert.equal(status(root, 'release-validation-gate'), 'fail')
 
     overwrite(root, '.github/workflows/release.yml', [
+      'on:',
+      '  push:',
       'jobs:',
       '  validate:',
       '    steps:',
@@ -168,6 +178,8 @@ test('counts only active blocking workflow commands as release validation', () =
     assert.equal(status(root, 'release-validation-gate'), 'fail')
 
     overwrite(root, '.github/workflows/release.yml', [
+      'on:',
+      '  push:',
       'jobs:',
       '  validate:',
       '    steps:',
@@ -181,6 +193,8 @@ test('counts only active blocking workflow commands as release validation', () =
     assert.equal(status(root, 'release-validation-gate'), 'fail')
 
     overwrite(root, '.github/workflows/release.yml', [
+      'on:',
+      '  push:',
       'jobs:',
       '  validate:',
       '    steps:',
@@ -194,6 +208,8 @@ test('counts only active blocking workflow commands as release validation', () =
     assert.equal(status(root, 'release-validation-gate'), 'fail')
 
     overwrite(root, '.github/workflows/release.yml', [
+      'on:',
+      '  push:',
       'jobs:',
       '  validate:',
       '    steps:',
@@ -206,6 +222,8 @@ test('counts only active blocking workflow commands as release validation', () =
     assert.equal(status(root, 'release-validation-gate'), 'fail')
 
     overwrite(root, '.github/workflows/release.yml', [
+      'on:',
+      '  push:',
       'jobs:',
       '  validate:',
       '    steps:',
@@ -219,6 +237,42 @@ test('counts only active blocking workflow commands as release validation', () =
     assert.equal(status(root, 'release-validation-gate'), 'fail')
 
     overwrite(root, '.github/workflows/release.yml', [
+      'on:',
+      '  pull_request:',
+      'jobs:',
+      '  validate:',
+      '    steps:',
+      '      - run: yarn generate',
+      '      - run: yarn build',
+      '      - run: yarn test',
+      '      - run: yarn db:migrate --check',
+    ].join('\n'))
+    assert.equal(status(root, 'release-validation-gate'), 'fail')
+
+    overwrite(root, '.github/workflows/release.yml', [
+      'on:',
+      '  push:',
+      'jobs:',
+      '  build:',
+      '    steps:',
+      '      - run: yarn generate',
+      '      - run: yarn build',
+    ].join('\n'))
+    overwrite(root, '.github/workflows/other.yml', [
+      'on:',
+      '  push:',
+      'jobs:',
+      '  verify:',
+      '    steps:',
+      '      - run: yarn test',
+      '      - run: yarn db:migrate --check',
+    ].join('\n'))
+    assert.equal(status(root, 'release-validation-gate'), 'fail')
+    fs.rmSync(path.join(root, '.github/workflows/other.yml'))
+
+    overwrite(root, '.github/workflows/release.yml', [
+      'on:',
+      '  push:',
       'jobs:',
       '  validate:',
       '    steps:',
@@ -262,6 +316,14 @@ test('requires effective worker and command evidence instead of comments or empt
     manifest.scripts.build = 'echo NODE_ENV=production && next build'
     fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify(manifest))
     assert.equal(status(root, 'runtime-production-scripts'), 'fail')
+    manifest.scripts.build = 'NODE_ENV=production next build || true'
+    manifest.scripts.start = 'next start'
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify(manifest))
+    assert.equal(status(root, 'runtime-production-scripts'), 'fail')
+    manifest.scripts.build = 'NODE_ENV=production next build'
+    manifest.scripts.start = 'next dev'
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify(manifest))
+    assert.equal(status(root, 'runtime-production-scripts'), 'fail')
 
     overwrite(root, 'next.config.ts', 'const active = true // Content-Security-Policy Referrer-Policy X-Content-Type-Options X-Frame-Options\nexport default { active }\n')
     assert.equal(status(root, 'edge-security-headers'), 'fail')
@@ -298,6 +360,13 @@ test('requires effective worker and command evidence instead of comments or empt
     overwrite(root, 'next.config.ts', 'export default { async headers() { return [{ source: "/:path*", headers: [], decoy: [{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }] }] } }\n')
     assert.equal(status(root, 'edge-security-headers'), 'fail')
     overwrite(root, 'next.config.ts', 'const securityHeaders = [{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }]\nexport default { async headers() { const securityHeaders = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options"]; return [{ source: "/:path*", headers: securityHeaders }] } }\n')
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    const validHeaders = '[{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }]'
+    overwrite(root, 'next.config.ts', `const decoy = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }\nexport default { async headers() { return [] } }\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { function decoy() { return [{ source: "/:path*", headers: ${validHeaders} }] } return [] } }\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `function decoy() { const securityHeaders = ${validHeaders}; return securityHeaders }\nexport default { async headers() { return [{ source: "/:path*", headers: securityHeaders }] } }\n`)
     assert.equal(status(root, 'edge-security-headers'), 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')

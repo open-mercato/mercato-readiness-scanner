@@ -376,6 +376,7 @@ function finalDockerUser(source: string): string | null {
 }
 
 type WorkflowCommand = { command: string, blocking: boolean }
+type WorkflowJob = { workflow: string, job: string, commands: WorkflowCommand[] }
 
 function constantBoolean(value: unknown, expected: boolean): boolean {
   if (value === expected) return true
@@ -401,28 +402,38 @@ function shellPreservesFailure(value: unknown): boolean {
   return tokens.some((token) => /^-[^-]*e[A-Za-z]*$/.test(token)) || /(?:^|\s)-o\s+errexit(?:\s|$)/i.test(value)
 }
 
-function workflowCommands(source: string): WorkflowCommand[] {
-  const commands: WorkflowCommand[] = []
+function releaseTrigger(value: unknown): boolean {
+  const accepted = new Set(['push', 'release', 'workflow_dispatch', 'workflow_call'])
+  if (typeof value === 'string') return accepted.has(value)
+  if (Array.isArray(value)) return value.some((entry) => typeof entry === 'string' && accepted.has(entry))
+  return isRecord(value) && Object.keys(value).some((key) => accepted.has(key))
+}
+
+function workflowJobs(workflow: string, source: string): WorkflowJob[] {
+  const jobs: WorkflowJob[] = []
   for (const document of parseAllDocuments(source)) {
     if (document.errors.length) continue
     const root: unknown = document.toJS()
-    if (!isRecord(root) || !isRecord(root.jobs)) continue
+    if (!isRecord(root) || !isRecord(root.jobs) || !releaseTrigger(root.on)) continue
     const workflowDefaults = isRecord(root.defaults) && isRecord(root.defaults.run) ? root.defaults.run : null
-    for (const value of Object.values(root.jobs)) {
+    for (const [job, value] of Object.entries(root.jobs)) {
       if (!isRecord(value) || !Array.isArray(value.steps)) continue
       const jobRuns = alwaysRuns(value.if)
       const jobBlocking = failureIsBlocking(value['continue-on-error'])
+      if (!jobRuns || !jobBlocking) continue
       const jobDefaults = isRecord(value.defaults) && isRecord(value.defaults.run) ? value.defaults.run : workflowDefaults
+      const commands: WorkflowCommand[] = []
       for (const step of value.steps) {
         if (!isRecord(step) || typeof step.run !== 'string') continue
-        const runs = jobRuns && alwaysRuns(step.if)
+        const runs = alwaysRuns(step.if)
         const shell = step.shell ?? jobDefaults?.shell
-        const blocking = jobBlocking && failureIsBlocking(step['continue-on-error']) && shellPreservesFailure(shell)
+        const blocking = failureIsBlocking(step['continue-on-error']) && shellPreservesFailure(shell)
         if (runs && step.run.trim()) commands.push({ command: step.run, blocking })
       }
+      jobs.push({ workflow, job, commands })
     }
   }
-  return commands
+  return jobs
 }
 
 function hasBlockingPackageCommand(commands: WorkflowCommand[], name: string): boolean {
@@ -435,7 +446,7 @@ function hasBlockingMigrationCommand(commands: WorkflowCommand[]): boolean {
 }
 
 function commandPreservesFailure(command: string): boolean {
-  return !/\||(?:^|[^&])&(?!&)|\bset\s+\+e\b|;\s*exit\s+0\b/i.test(command)
+  return !/\||(?:^|[^&])&(?!&)|\bset\s+\+e\b|(?:;|\n)\s*(?:exit\s+0|true|:)(?:\s|$)/i.test(command)
 }
 
 type DependencyMutation = 'immutable' | 'mutable'
@@ -515,40 +526,136 @@ function extractDelimitedBody(source: string, openingIndex: number, opening: str
   return null
 }
 
+function topLevelProjection(source: string): string {
+  const output = Array.from({ length: source.length }, () => ' ')
+  const depths = { brace: 0, bracket: 0, parenthesis: 0 }
+  let quote = ''
+  let escaped = false
+  const atTop = (): boolean => depths.brace === 0 && depths.bracket === 0 && depths.parenthesis === 0
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index] ?? ''
+    if (character === '\n') output[index] = '\n'
+    if (quote) {
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === quote) quote = ''
+      continue
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character
+      continue
+    }
+    if (character === '{' || character === '[' || character === '(') {
+      if (atTop()) output[index] = character
+      if (character === '{') depths.brace += 1
+      if (character === '[') depths.bracket += 1
+      if (character === '(') depths.parenthesis += 1
+      continue
+    }
+    if (character === '}' || character === ']' || character === ')') {
+      if (character === '}') depths.brace = Math.max(0, depths.brace - 1)
+      if (character === ']') depths.bracket = Math.max(0, depths.bracket - 1)
+      if (character === ')') depths.parenthesis = Math.max(0, depths.parenthesis - 1)
+      if (atTop()) output[index] = character
+      continue
+    }
+    if (atTop()) output[index] = character
+  }
+  return output.join('')
+}
+
+function escapedIdentifier(identifier: string): string {
+  return identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 function declaredArray(scope: string, identifier: string): string | null {
-  const pattern = new RegExp(`(?:const|let|var)\\s+${identifier.replace(/[$]/g, '\\$&')}\\s*=\\s*\\[`, 'gm')
+  const projection = topLevelProjection(scope)
+  const pattern = new RegExp(`(?:const|let|var)\\s+${escapedIdentifier(identifier)}\\s*=\\s*\\[`, 'gm')
   let selected: RegExpExecArray | null = null
-  for (const match of scope.matchAll(pattern)) selected = match
+  for (const match of projection.matchAll(pattern)) selected = match
   if (!selected) return null
-  const openingBracket = scope.indexOf('[', selected.index)
+  const openingBracket = projection.indexOf('[', selected.index)
   return extractDelimitedBody(scope, openingBracket, '[', ']')
+}
+
+function exportedConfigObject(source: string): { body: string, start: number } | null {
+  const projection = topLevelProjection(source)
+  const exports = [...projection.matchAll(/\bexport\s+default\s+/g)]
+  const exported = exports.at(-1)
+  if (!exported) return null
+  const valueStart = (exported.index ?? 0) + exported[0].length
+  const remainder = source.slice(valueStart).trimStart()
+  const offset = valueStart + source.slice(valueStart).length - remainder.length
+  if (remainder.startsWith('{')) {
+    const body = extractDelimitedBody(source, offset, '{', '}')
+    return body === null ? null : { body, start: offset }
+  }
+  const identifier = remainder.match(/^([A-Za-z_$][\w$]*)\b/)?.[1]
+  if (!identifier) return null
+  const beforeExport = projection.slice(0, exported.index)
+  const declarations = [...beforeExport.matchAll(new RegExp(`(?:const|let|var)\\s+${escapedIdentifier(identifier)}\\s*=\\s*\\{`, 'gm'))]
+  const declaration = declarations.at(-1)
+  if (!declaration) return null
+  const openingBrace = projection.indexOf('{', declaration.index)
+  const body = extractDelimitedBody(source, openingBrace, '{', '}')
+  return body === null ? null : { body, start: openingBrace }
+}
+
+function activeHeadersBody(configBody: string): string | null {
+  const projection = topLevelProjection(configBody)
+  const patterns = [
+    /(?:^|[,;])\s*(?:async\s+)?headers\s*\([^)]*\)\s*\{/gm,
+    /(?:^|[,;])\s*headers\s*:\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*(?:=>\s*)?\{/gm,
+  ]
+  for (const pattern of patterns) {
+    const match = pattern.exec(projection)
+    if (!match) continue
+    const openingBrace = projection.indexOf('{', match.index)
+    return extractDelimitedBody(configBody, openingBrace, '{', '}')
+  }
+  return null
+}
+
+function topLevelObjectBodies(source: string): string[] {
+  const projection = topLevelProjection(source)
+  const bodies: string[] = []
+  for (let index = 0; index < projection.length; index += 1) {
+    if (projection[index] !== '{') continue
+    const body = extractDelimitedBody(source, index, '{', '}')
+    if (body !== null) bodies.push(body)
+  }
+  return bodies
 }
 
 function activeHeaderEntries(source: string): Map<string, string> {
   const entries = new Map<string, string>()
-  const functionMatch = /(?:async\s+)?headers\s*\(\s*\)\s*\{|headers\s*:\s*(?:async\s*)?(?:function\s*\([^)]*\)|\([^)]*\)\s*=>)\s*\{/m.exec(source)
-  if (!functionMatch) return entries
-  const openingBrace = source.indexOf('{', functionMatch.index)
-  const body = extractDelimitedBody(source, openingBrace, '{', '}')
+  const config = exportedConfigObject(source)
+  if (!config) return entries
+  const body = activeHeadersBody(config.body)
   if (!body) return entries
-  const returned = /\breturn\s*\[/m.exec(body)
+  const bodyProjection = topLevelProjection(body)
+  const returned = /\breturn\s*\[/m.exec(bodyProjection)
   if (!returned) return entries
-  const openingBracket = body.indexOf('[', returned.index)
+  const openingBracket = bodyProjection.indexOf('[', returned.index)
   const returnedEntries = extractDelimitedBody(body, openingBracket, '[', ']')
   if (!returnedEntries) return entries
   const headerArrays: string[] = []
-  for (const match of returnedEntries.matchAll(/\bheaders\s*:\s*/g)) {
-    const valueStart = (match.index ?? 0) + match[0].length
-    const remainder = returnedEntries.slice(valueStart)
+  for (const route of topLevelObjectBodies(returnedEntries)) {
+    const routeProjection = topLevelProjection(route)
+    const match = /\bheaders\s*:\s*/m.exec(routeProjection)
+    if (!match) continue
+    const valueStart = match.index + match[0].length
+    const remainder = route.slice(valueStart).trimStart()
+    const offset = valueStart + route.slice(valueStart).length - remainder.length
     if (remainder.startsWith('[')) {
-      const inline = extractDelimitedBody(returnedEntries, valueStart, '[', ']')
+      const inline = extractDelimitedBody(route, offset, '[', ']')
       if (inline) headerArrays.push(inline)
       continue
     }
     const identifier = remainder.match(/^([A-Za-z_$][\w$]*)\b/)?.[1]
     if (!identifier) continue
     const local = declaredArray(body.slice(0, returned.index), identifier)
-    const global = local ?? declaredArray(source.slice(0, functionMatch.index), identifier)
+    const global = local ?? declaredArray(source.slice(0, config.start), identifier)
     if (global) headerArrays.push(global)
   }
   for (const object of headerArrays.join('\n').match(/\{[^{}]*\}/g) ?? []) {
@@ -615,14 +722,19 @@ export const RULES: readonly RuleDefinition[] = [
   }),
   rule({
     id: 'runtime-production-scripts', title: 'Production build and start scripts are explicit', category: 'Runtime', severity: 'high',
-    remediation: 'Define build and start scripts, and force NODE_ENV=production during the production build.',
+    remediation: 'Define failure-preserving production build and start scripts, force NODE_ENV=production during the build, and never use a development server for production.',
     check: (context) => {
       const values = scripts(context)
       const missing = ['build', 'start'].filter((name) => !values[name])
       if (missing.length) return { status: 'fail', summary: 'Production lifecycle scripts are incomplete.', evidence: missing.map((name) => `Missing package script: ${name}`) }
       const build = values.build ?? ''
-      const productionBuild = /(?:^|&&|;)\s*(?:cross-env\s+)?NODE_ENV=production\s+(?:(?:next|mercato)\s+build|(?:yarn|pnpm|npm(?:\s+run)?)\s+build(?::[A-Za-z0-9_-]+)?)(?:\s|$)/i.test(build)
-      if (!productionBuild) return { status: 'fail', summary: 'The build script does not explicitly force NODE_ENV=production for the build command.' }
+      const start = values.start ?? ''
+      const productionBuild = /^\s*(?:cross-env(?:-shell)?\s+)?NODE_ENV=production\s+(?:next|mercato)\s+build(?:[ \t]+[^;&|\r\n]+)?\s*$/i.test(build)
+        && commandPreservesFailure(build)
+      if (!productionBuild) return { status: 'fail', summary: 'The build script does not run a failure-preserving production build with NODE_ENV=production.' }
+      const productionStart = /^\s*(?:cross-env(?:-shell)?\s+)?(?:(?:[A-Za-z_][A-Za-z0-9_]*)=(?:"[^"]*"|'[^']*'|[^\s]+)[ \t]+)*(?:next[ \t]+start|mercato[ \t]+(?:server[ \t]+)?start|node[ \t]+(?:\.next\/standalone\/)?server(?:\.js)?)(?:[ \t]+[^;&|\r\n]+)?\s*$/i.test(start)
+        && commandPreservesFailure(start)
+      if (!productionStart) return { status: 'fail', summary: 'The start script does not launch a failure-preserving production server.' }
       return { status: 'pass', summary: 'Production build and start scripts are present and production mode is explicit.' }
     },
   }),
@@ -778,19 +890,16 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'release-validation-gate', title: 'Release validation gates the exact revision', category: 'Release', severity: 'high',
     remediation: 'Make generation, production build, tests, and migration verification blocking steps for the exact release revision.',
     check: (context) => {
-      const source = context.collectCiText()
-      if (!source) return { status: 'warning', summary: 'No recognized in-repository CI workflow was found; verify the external release gate.' }
-      const commands = workflowCommands(source)
-      const required = [
-        ['generation', hasBlockingPackageCommand(commands, 'generate')],
-        ['production build', hasBlockingPackageCommand(commands, 'build')],
-        ['tests', hasBlockingPackageCommand(commands, 'test')],
-        ['migration verification', hasBlockingMigrationCommand(commands)],
-      ] as const
-      const missing = required.filter(([, present]) => !present).map(([name]) => name)
-      return missing.length
-        ? { status: 'fail', summary: 'The release validation workflow is incomplete.', evidence: missing.map((name) => `Missing blocking stage: ${name}`) }
-        : { status: 'pass', summary: 'CI represents generation, build, tests, and migration verification.' }
+      const workflows = context.collectCiWorkflows()
+      if (!workflows.length) return { status: 'warning', summary: 'No recognized in-repository CI workflow was found; verify the external release gate.' }
+      const jobs = workflows.flatMap(({ path, source }) => workflowJobs(path, source))
+      const complete = jobs.find(({ commands }) => hasBlockingPackageCommand(commands, 'generate')
+        && hasBlockingPackageCommand(commands, 'build')
+        && hasBlockingPackageCommand(commands, 'test')
+        && hasBlockingMigrationCommand(commands))
+      return complete
+        ? { status: 'pass', summary: 'One release-triggered blocking job gates generation, build, tests, and migration verification.', evidence: [`Release gate: ${complete.workflow} job ${displayPath(complete.job)}`] }
+        : { status: 'fail', summary: 'No single release-triggered blocking job gates generation, build, tests, and migration verification.' }
     },
   }),
   rule({
