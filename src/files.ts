@@ -128,6 +128,13 @@ export function collectDeploymentText(root: string): string {
 }
 
 export function collectCiText(root: string): string {
+  return collectCiWorkflows(root).map(({ source }) => source).join('\n---\n')
+}
+
+export function collectCiWorkflows(root: string): Array<{ path: string, source: string }> {
   const files = collectTextFiles(root, '.github/workflows', /\.(?:yml|yaml)$/i)
-  return files.map((file) => readSafeText(root, file)).filter((value): value is string => value !== null).join('\n---\n')
+  return files.flatMap((file) => {
+    const source = readSafeText(root, file)
+    return source === null ? [] : [{ path: file, source }]
+  })
 }
