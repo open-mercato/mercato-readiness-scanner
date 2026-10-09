@@ -1,5 +1,5 @@
 {
-  "name": "@open-mercato/readiness-scanner",
+  "name": "@open-mercato/mercato-readiness-scanner",
   "version": "0.1.0",
   "description": "Static production-readiness scanner for Open Mercato applications.",
   "private": true,
@@ -21,7 +21,8 @@
     "test": "node --import tsx --test test/*.test.ts",
     "test:built": "node --test test-built/*.test.mjs",
     "pack:check": "node scripts/check-package.mjs",
-    "check": "npm run typecheck && npm test && npm run build && npm run test:built && npm run pack:check"
+    "registry:check": "node scripts/check-private-registry.mjs",
+    "check": "npm run typecheck && npm test && npm run build && npm run test:built && npm run pack:check && npm run registry:check"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",

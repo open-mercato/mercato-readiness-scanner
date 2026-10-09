@@ -12,7 +12,7 @@
       "additionalProperties": false,
       "required": ["name", "version"],
       "properties": {
-        "name": { "const": "@open-mercato/readiness-scanner" },
+        "name": { "const": "@open-mercato/mercato-readiness-scanner" },
         "version": { "type": "string" }
       }
     },

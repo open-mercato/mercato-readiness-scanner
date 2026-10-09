@@ -25,7 +25,7 @@ export function scan(start: string, now = new Date()): ScanReport {
   for (const result of results) summary[result.status] += 1
   return {
     schemaVersion: 1,
-    tool: { name: '@open-mercato/readiness-scanner', version: VERSION },
+    tool: { name: '@open-mercato/mercato-readiness-scanner', version: VERSION },
     scannedAt: now.toISOString(),
     target: displayName(path.basename(root)),
     summary,

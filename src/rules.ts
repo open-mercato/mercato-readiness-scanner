@@ -202,14 +202,29 @@ function uncommented(source: string): string {
   return output
 }
 
+const DEPLOYMENT_FILES = ['Dockerfile', 'railway.toml', 'railway.worker.toml', 'scripts/railway-start.sh', 'scripts/railway-worker.sh', 'docker/scripts/init-or-migrate.sh'] as const
+const COMPOSE_FILES = ['docker-compose.yml', 'docker-compose.fullapp.yml'] as const
+
 function executableDeploymentText(context: ScanContext): string {
-  return ['Dockerfile', 'railway.toml', 'railway.worker.toml', 'scripts/railway-start.sh', 'scripts/railway-worker.sh', 'docker/scripts/init-or-migrate.sh']
+  return DEPLOYMENT_FILES
     .map((file) => uncommented(context.readText(file) ?? ''))
     .join('\n')
 }
 
 function isWorkerCommand(value: string): boolean {
-  return /(?:^|[;&]\s*)(?:exec\s+)?(?:(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:mercato\s+)?worker|mercato\s+worker)(?:\s|$)/im.test(value)
+  return /(?:^|[;&]\s*)(?:exec\s+)?(?:(?:yarn|pnpm)(?:\s+run)?\s+(?:mercato\s+)?worker|npm\s+run\s+(?:mercato\s+)?worker|mercato\s+worker)(?:\s|$)/im.test(value)
+}
+
+function composeServices(context: ScanContext, file: string): Array<[string, Record<string, unknown>]> | null {
+  const source = context.readText(file)
+  if (!source) return []
+  try {
+    const root: unknown = parse(source, { merge: true })
+    if (!isRecord(root) || !isRecord(root.services)) return null
+    return Object.entries(root.services).filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]))
+  } catch {
+    return null
+  }
 }
 
 function workerDefinitions(context: ScanContext): string[] {
@@ -221,21 +236,12 @@ function workerDefinitions(context: ScanContext): string[] {
   }
   const script = context.readText('scripts/railway-worker.sh')
   if (script && isWorkerCommand(uncommented(script))) paths.push('scripts/railway-worker.sh')
-  const compose = context.readText('docker-compose.fullapp.yml')
-  if (compose) {
-    try {
-      const root: unknown = parse(compose, { merge: true })
-      if (isRecord(root) && isRecord(root.services)) {
-        const worker = Object.entries(root.services).some(([name, value]) => {
-          if (!isRecord(value)) return false
-          const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
-          return isWorkerCommand(command)
-        })
-        if (worker) paths.push('docker-compose.fullapp.yml')
-      }
-    } catch {
-      return paths
-    }
+  for (const file of COMPOSE_FILES) {
+    const services = composeServices(context, file)
+    if (services?.some(([, value]) => {
+      const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
+      return isWorkerCommand(command)
+    })) paths.push(file)
   }
   return paths
 }
@@ -244,64 +250,89 @@ type ArtifactParity = { mismatch: boolean, complete: boolean, evidence: string[]
 
 function composeArtifact(value: Record<string, unknown>): string | null {
   if (typeof value.image === 'string') return `image:${value.image}`
-  if (typeof value.build === 'string') return `build:${value.build}/Dockerfile`
+  if (typeof value.build === 'string') {
+    const prefix = value.build === '.' ? '' : `${value.build.replace(/\/$/, '')}/`
+    return `dockerfile:${prefix}Dockerfile`
+  }
   if (isRecord(value.build)) {
     const context = typeof value.build.context === 'string' ? value.build.context : '.'
     const dockerfile = typeof value.build.dockerfile === 'string' ? value.build.dockerfile : 'Dockerfile'
-    return `build:${context}/${dockerfile}`
+    const prefix = context === '.' ? '' : `${context.replace(/\/$/, '')}/`
+    return `dockerfile:${prefix}${dockerfile}`
   }
   return null
 }
 
 function workerArtifactParity(context: ScanContext): ArtifactParity {
   const evidence: string[] = []
+  const comparableArtifacts = new Map<string, Set<string>>()
   let complete = true
   let mismatch = false
   if (workerDefinitions(context).includes('railway.worker.toml')) {
-    const web = context.readText('railway.toml')
-    const worker = context.readText('railway.worker.toml')
+    const web = uncommented(context.readText('railway.toml') ?? '')
+    const worker = uncommented(context.readText('railway.worker.toml') ?? '')
     if (!web?.trim() || !worker?.trim()) complete = false
     else {
       const webArtifact = web.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1] ?? 'Dockerfile'
       const workerArtifact = worker.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1] ?? 'Dockerfile'
       evidence.push(`Railway web artifact: ${displayPath(webArtifact)}`, `Railway worker artifact: ${displayPath(workerArtifact)}`)
       if (webArtifact !== workerArtifact) mismatch = true
+      const artifacts = comparableArtifacts.get('dockerfile') ?? new Set<string>()
+      artifacts.add(`dockerfile:${webArtifact}`).add(`dockerfile:${workerArtifact}`)
+      comparableArtifacts.set('dockerfile', artifacts)
     }
   }
-  const compose = context.readText('docker-compose.fullapp.yml')
-  if (compose) {
-    try {
-      const root: unknown = parse(compose, { merge: true })
-      if (isRecord(root) && isRecord(root.services)) {
-        const services = Object.entries(root.services).filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]))
-        const workers = services.filter(([name, value]) => {
-          const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
-          return isWorkerCommand(command)
-        })
-        if (workers.length) {
-          const web = services.find(([name, value]) => {
-            const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
-            return !isWorkerCommand(command) && /^(?:app|web|mercato)$/i.test(name)
-          })
-          if (!web) complete = false
-          else {
-            const webArtifact = composeArtifact(web[1])
-            if (!webArtifact) complete = false
-            for (const [name, value] of workers) {
-              const workerArtifact = composeArtifact(value)
-              if (!workerArtifact) complete = false
-              else {
-                evidence.push(`Compose web artifact: ${displayPath(webArtifact ?? 'unknown')}`, `Compose ${displayPath(name)} artifact: ${displayPath(workerArtifact)}`)
-                if (webArtifact !== workerArtifact) mismatch = true
-              }
-            }
-          }
-        }
-      }
-    } catch {
+  for (const file of COMPOSE_FILES) {
+    const services = composeServices(context, file)
+    if (services === null) {
       complete = false
+      continue
+    }
+    const workers = services.filter(([, value]) => {
+      const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
+      return isWorkerCommand(command)
+    })
+    const web = services.find(([name, value]) => {
+      const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
+      return !isWorkerCommand(command) && /^(?:app|web|mercato)$/i.test(name)
+    })
+    if (!workers.length) {
+      if (web && workerDefinitions(context).length > 0) {
+        const webArtifact = composeArtifact(web[1])
+        if (webArtifact) {
+          evidence.push(`${file} web artifact: ${displayPath(webArtifact)}`)
+          const kind = webArtifact.split(':', 1)[0] ?? ''
+          const known = comparableArtifacts.get(kind) ?? new Set<string>()
+          known.add(webArtifact)
+          comparableArtifacts.set(kind, known)
+        } else complete = false
+      }
+      continue
+    }
+    if (!web) {
+      complete = false
+      continue
+    }
+    const webArtifact = composeArtifact(web[1])
+    if (!webArtifact) complete = false
+    for (const [name, value] of workers) {
+      const workerArtifact = composeArtifact(value)
+      if (!workerArtifact || !webArtifact) {
+        complete = false
+        continue
+      }
+      evidence.push(`${file} web artifact: ${displayPath(webArtifact)}`, `${file} ${displayPath(name)} artifact: ${displayPath(workerArtifact)}`)
+      if (webArtifact !== workerArtifact) mismatch = true
+      for (const artifact of [webArtifact, workerArtifact]) {
+        const kind = artifact.split(':', 1)[0] ?? ''
+        const known = comparableArtifacts.get(kind) ?? new Set<string>()
+        known.add(artifact)
+        comparableArtifacts.set(kind, known)
+      }
     }
   }
+  if ([...comparableArtifacts.values()].some((artifacts) => artifacts.size > 1)) mismatch = true
+  if (comparableArtifacts.size > 1) complete = false
   if (workerDefinitions(context).includes('scripts/railway-worker.sh')) complete = false
   return { mismatch, complete, evidence }
 }
@@ -387,19 +418,100 @@ function hasBlockingMigrationCommand(commands: WorkflowCommand[]): boolean {
 }
 
 function commandPreservesFailure(command: string): boolean {
-  return !/\||\bset\s+\+e\b|;\s*exit\s+0\b/i.test(command)
+  return !/\||(?:^|[^&])&(?!&)|\bset\s+\+e\b|;\s*exit\s+0\b/i.test(command)
 }
 
-function finalDependencyInstallIsImmutable(context: ScanContext): boolean {
-  const source = executableDeploymentText(context)
-  const installs = [...source.matchAll(/\b(yarn\s+install\b[^\n;&|]*|npm\s+(?:ci|install)\b[^\n;&|]*|pnpm\s+install\b[^\n;&|]*)/gi)]
-    .map((match) => match[1]?.trim() ?? '')
-    .filter(Boolean)
-  const finalInstall = installs.at(-1)
-  if (!finalInstall) return false
-  return /^npm\s+ci\b/i.test(finalInstall)
-    || /^yarn\s+install\b[^\n]*\s--(?:immutable|frozen-lockfile)(?:\s|$)/i.test(finalInstall)
-    || /^pnpm\s+install\b[^\n]*\s--frozen-lockfile(?:\s|$)/i.test(finalInstall)
+type DependencyMutation = 'immutable' | 'mutable'
+
+function dependencyMutation(command: string): DependencyMutation | null {
+  const normalized = command
+    .trim()
+    .replace(/^(?:RUN|CMD|ENTRYPOINT)\s+/i, '')
+    .replace(/^[A-Za-z][\w.-]*(?:Command|command)\s*=\s*["']?/i, '')
+    .replace(/^["']/, '')
+    .replace(/^(?:exec\s+|sudo\s+|corepack\s+)+/i, '')
+    .trim()
+  const match = normalized.match(/^(npm|yarn|pnpm)\s+([^\s"']+)([^\n]*)/i)
+  if (!match?.[1] || !match[2]) return null
+  const manager = match[1].toLowerCase()
+  const action = match[2].toLowerCase()
+  const args = match[3] ?? ''
+  if (manager === 'npm') {
+    if (action === 'ci') return 'immutable'
+    if (['install', 'i', 'add', 'update', 'up'].includes(action)) return 'mutable'
+    return null
+  }
+  if (manager === 'yarn') {
+    if (action === 'install') return /(?:^|\s)--(?:immutable|frozen-lockfile)(?:\s|$)/i.test(args) ? 'immutable' : 'mutable'
+    if (['add', 'update', 'up', 'upgrade'].includes(action)) return 'mutable'
+    return null
+  }
+  if (action === 'install' || action === 'i') return /(?:^|\s)--frozen-lockfile(?:\s|$)/i.test(args) ? 'immutable' : 'mutable'
+  if (['add', 'update', 'up'].includes(action)) return 'mutable'
+  return null
+}
+
+function dependencyInstallationProof(context: ScanContext): { found: boolean, mutableSurfaces: string[] } {
+  let found = false
+  const mutableSurfaces: string[] = []
+  for (const file of DEPLOYMENT_FILES) {
+    const source = uncommented(context.readText(file) ?? '').replace(/\\\r?\n/g, ' ')
+    if (!source.trim()) continue
+    const mutations = source
+      .split(/\r?\n|&&|\|\||;|&|\|/)
+      .map(dependencyMutation)
+      .filter((value): value is DependencyMutation => value !== null)
+    if (!mutations.length) continue
+    found = true
+    if (mutations.at(-1) !== 'immutable') mutableSurfaces.push(file)
+  }
+  return { found, mutableSurfaces }
+}
+
+function extractDelimitedBody(source: string, openingIndex: number, opening: string, closing: string): string | null {
+  let depth = 0
+  let quote = ''
+  let escaped = false
+  for (let index = openingIndex; index < source.length; index += 1) {
+    const character = source[index] ?? ''
+    if (quote) {
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === quote) quote = ''
+      continue
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character
+      continue
+    }
+    if (character === opening) depth += 1
+    if (character === closing) {
+      depth -= 1
+      if (depth === 0) return source.slice(openingIndex + 1, index)
+    }
+  }
+  return null
+}
+
+function activeHeaderEvidence(source: string): string {
+  const functionMatch = /(?:async\s+)?headers\s*\(\s*\)\s*\{|headers\s*:\s*(?:async\s*)?(?:function\s*\([^)]*\)|\([^)]*\)\s*=>)\s*\{/m.exec(source)
+  if (!functionMatch) return ''
+  const openingBrace = source.indexOf('{', functionMatch.index)
+  const body = extractDelimitedBody(source, openingBrace, '{', '}')
+  if (!body) return ''
+  const returned = /\breturn\s*\[/m.exec(body)
+  if (!returned) return ''
+  const openingBracket = body.indexOf('[', returned.index)
+  const returnedEntries = extractDelimitedBody(body, openingBracket, '[', ']')
+  if (!returnedEntries) return ''
+  const evidence = [returnedEntries]
+  for (const match of returnedEntries.matchAll(/\bheaders\s*:\s*([A-Za-z_$][\w$]*)\b/g)) {
+    const identifier = match[1]
+    if (!identifier) continue
+    const declaration = new RegExp(`(?:const|let|var)\\s+${identifier.replace(/[$]/g, '\\$&')}\\s*=\\s*\\[([\\s\\S]*?)\\]`, 'm').exec(source)
+    if (declaration?.[0]) evidence.push(declaration[0])
+  }
+  return evidence.join('\n')
 }
 
 function requiresNode24OrNewer(range: string): boolean {
@@ -512,10 +624,11 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Keep the shared CSP and security headers in next.config.ts and verify that the public edge preserves them.',
     check: (context) => {
       const source = uncommented(context.readText('next.config.ts') ?? context.readText('next.config.mjs') ?? '')
+      const activeHeaders = activeHeaderEvidence(source)
       const required = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options']
-      const missing = required.filter((header) => !source.includes(header))
-      if (!/X-Frame-Options|frame-ancestors/.test(source)) missing.push('frame protection')
-      if (!/(?:async\s+)?headers\s*\(\s*\)\s*\{|headers\s*:\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)/m.test(source)) missing.push('active Next.js headers configuration')
+      const missing = required.filter((header) => !activeHeaders.includes(header))
+      if (!/X-Frame-Options|frame-ancestors/.test(activeHeaders)) missing.push('frame protection')
+      if (!activeHeaders) missing.push('active Next.js headers configuration')
       return missing.length
         ? { status: 'fail', summary: 'The application configuration does not declare the complete security-header baseline.', evidence: missing.map((header) => `Missing header: ${header}`) }
         : { status: 'pass', summary: 'The application declares CSP, referrer, frame, and MIME-sniffing protection headers.' }
@@ -561,9 +674,13 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'supply-chain-immutable-install', title: 'Deployments use immutable dependency installation', category: 'Supply chain', severity: 'high',
     remediation: 'Commit one lockfile and use an immutable/frozen install in image and CI builds.',
-    check: (context) => finalDependencyInstallIsImmutable(context)
-      ? { status: 'pass', summary: 'Deployment configuration uses an immutable dependency install.' }
-      : { status: 'fail', summary: 'No immutable dependency installation was found in deployment configuration.' },
+    check: (context) => {
+      const proof = dependencyInstallationProof(context)
+      if (!proof.found) return { status: 'fail', summary: 'No immutable dependency installation was found in deployment configuration.' }
+      return proof.mutableSurfaces.length === 0
+        ? { status: 'pass', summary: 'Every detected deployment install surface ends with an immutable dependency install.' }
+        : { status: 'fail', summary: 'A deployment surface can finish with a mutable dependency tree.', evidence: proof.mutableSurfaces.map((file) => `Mutable final install: ${file}`) }
+    },
   }),
   rule({
     id: 'supply-chain-single-lockfile', title: 'Exactly one package lockfile is committed', category: 'Supply chain', severity: 'medium',

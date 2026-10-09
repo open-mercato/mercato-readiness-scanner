@@ -118,3 +118,8 @@ npm run check
 
 `npm run check` type-checks, runs the Node test suite, and builds the CLI. Do not
 publish the package or make this repository public without explicit approval.
+
+The private package identity is `@open-mercato/mercato-readiness-scanner`.
+`npm run registry:check` fails if that name appears on the public npm registry.
+The public package named `@open-mercato/readiness-scanner` is unrelated to this
+private repository and must not be installed as this tool.

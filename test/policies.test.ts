@@ -131,6 +131,19 @@ test('counts only active blocking workflow commands as release validation', () =
       assert.equal(status(root, 'release-validation-gate'), 'fail', testCommand)
     }
 
+    for (const shell of [null, 'bash -e {0}']) {
+      overwrite(root, '.github/workflows/release.yml', [
+        'jobs:',
+        '  validate:',
+        '    steps:',
+        '      - run: yarn generate',
+        '      - run: yarn build',
+        ...(shell ? [`      - shell: ${shell}`, '        run: yarn test & true'] : ['      - run: yarn test & true']),
+        '      - run: yarn db:migrate --check',
+      ].join('\n'))
+      assert.equal(status(root, 'release-validation-gate'), 'fail', shell ?? 'default shell')
+    }
+
     overwrite(root, '.github/workflows/release.yml', [
       'jobs:',
       '  validate:',
@@ -259,6 +272,9 @@ test('requires effective worker and command evidence instead of comments or empt
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "echo worker"\n')
     assert.equal(status(root, 'operations-worker-topology'), 'fail')
 
+    overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "npm worker"\n')
+    assert.equal(status(root, 'operations-worker-topology'), 'fail')
+
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "yarn mercato worker"\n')
     overwrite(root, 'docker-compose.fullapp.yml', [
       'services:',
@@ -273,8 +289,36 @@ test('requires effective worker and command evidence instead of comments or empt
     overwrite(root, 'next.config.ts', 'const unused = "Content-Security-Policy Referrer-Policy X-Content-Type-Options X-Frame-Options"\nexport default {}\n')
     assert.equal(status(root, 'edge-security-headers'), 'fail')
 
+    overwrite(root, 'next.config.ts', 'const unused = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options", "X-Frame-Options"]\nexport default { async headers() { return [] } }\n')
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', 'const securityHeaders = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options", "X-Frame-Options"]\nexport default { async headers() { return []; const unused = { headers: securityHeaders } } }\n')
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
     assert.equal(status(root, 'supply-chain-immutable-install'), 'fail')
+
+    for (const dockerfile of [
+      'FROM node:24\nRUN npm ci; npm i\nUSER app\n',
+      'FROM node:24\nRUN npm ci; npm update\nUSER app\n',
+      'FROM node:24\nRUN npm install; echo npm ci\nUSER app\n',
+    ]) {
+      overwrite(root, 'Dockerfile', dockerfile)
+      assert.equal(status(root, 'supply-chain-immutable-install'), 'fail', dockerfile)
+    }
+
+    overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm install\nUSER app\n')
+    overwrite(root, 'scripts/railway-start.sh', 'npm ci\n')
+    assert.equal(status(root, 'supply-chain-immutable-install'), 'fail')
+
+    overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:one\n  worker:\n    image: worker:two\n    command: yarn mercato worker\n')
+    assert.equal(status(root, 'workers-release-parity'), 'fail')
+
+    overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:one\n  worker:\n    image: app:one\n    command: yarn mercato worker\n')
+    overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    image: app:two\n  worker:\n    image: app:two\n    command: yarn mercato worker\n')
+    assert.equal(status(root, 'workers-release-parity'), 'fail')
+
+    overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:three\n')
+    assert.equal(status(root, 'workers-release-parity'), 'fail')
   } finally {
     removeFixture(root)
   }

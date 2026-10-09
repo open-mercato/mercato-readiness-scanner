@@ -108,8 +108,15 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
       overwrite(root, '.github/workflows/release.yml', `${workflowPrefix}      - shell: bash {0}\n        run: |\n          ${testCommand}\n      - run: yarn db:migrate --check\n`)
       assert.equal(scan(root).get('release-validation-gate')?.status, 'fail', testCommand)
     }
+    for (const shell of [null, 'bash -e {0}']) {
+      const testStep = shell ? `      - shell: ${shell}\n        run: yarn test & true\n` : '      - run: yarn test & true\n'
+      overwrite(root, '.github/workflows/release.yml', `${workflowPrefix}${testStep}      - run: yarn db:migrate --check\n`)
+      assert.equal(scan(root).get('release-validation-gate')?.status, 'fail', shell ?? 'default shell')
+    }
 
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "echo worker"\n')
+    assert.equal(scan(root).get('operations-worker-topology')?.status, 'fail')
+    overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "npm worker"\n')
     assert.equal(scan(root).get('operations-worker-topology')?.status, 'fail')
 
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "yarn mercato worker"\n')
@@ -118,9 +125,32 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
 
     overwrite(root, 'next.config.ts', 'const unused = "Content-Security-Policy Referrer-Policy X-Content-Type-Options X-Frame-Options"\nexport default {}\n')
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', 'const unused = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options", "X-Frame-Options"]\nexport default { async headers() { return [] } }\n')
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', 'const securityHeaders = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options", "X-Frame-Options"]\nexport default { async headers() { return []; const unused = { headers: securityHeaders } } }\n')
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
     assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'fail')
+    for (const dockerfile of [
+      'FROM node:24\nRUN npm ci; npm i\nUSER app\n',
+      'FROM node:24\nRUN npm ci; npm update\nUSER app\n',
+      'FROM node:24\nRUN npm install; echo npm ci\nUSER app\n',
+    ]) {
+      overwrite(root, 'Dockerfile', dockerfile)
+      assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'fail', dockerfile)
+    }
+    overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm install\nUSER app\n')
+    overwrite(root, 'scripts/railway-start.sh', 'npm ci\n')
+    assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'fail')
+
+    overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:one\n  worker:\n    image: worker:two\n    command: yarn mercato worker\n')
+    assert.equal(scan(root).get('workers-release-parity')?.status, 'fail')
+    overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:one\n  worker:\n    image: app:one\n    command: yarn mercato worker\n')
+    overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    image: app:two\n  worker:\n    image: app:two\n    command: yarn mercato worker\n')
+    assert.equal(scan(root).get('workers-release-parity')?.status, 'fail')
+    overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:three\n')
+    assert.equal(scan(root).get('workers-release-parity')?.status, 'fail')
 
     const safeTemplate = 'NODE_ENV=production\nAPP_URL=https://example.com\nDATABASE_URL=\nINTERNAL_APP_ORIGIN=\nPLATFORM_PRIMARY_HOST=\nRATE_LIMIT_TRUST_PROXY_DEPTH=1\nAPP_ALLOWED_ORIGINS=https://example.com\nCACHE_STRATEGY=redis\nREDIS_URL=\n'
     for (const enabled of ['QUERY_ENGINE_DEBUG_SQL=" true "', 'DEMO_MODE=enabled', 'PROFILE_MODE=y']) {

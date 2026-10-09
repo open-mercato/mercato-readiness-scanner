@@ -26,7 +26,7 @@ export type ScanSummary = Record<FindingStatus, number> & {
 export type ScanReport = {
   schemaVersion: 1
   tool: {
-    name: '@open-mercato/readiness-scanner'
+    name: '@open-mercato/mercato-readiness-scanner'
     version: string
   }
   scannedAt: string
