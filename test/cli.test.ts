@@ -4,6 +4,7 @@ import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
+import { RULES } from '../src/rules.js'
 import { makeAppFixture, removeFixture } from './fixture.js'
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
@@ -24,11 +25,12 @@ test('keeps terminal output while saving Markdown and JSON reports', () => {
   try {
     const result = run(['scan', root, '--no-color', '--markdown', markdownPath, '--json', jsonPath])
     assert.equal(result.status, 0, result.stderr)
+    assert.equal(result.stderr, '')
     assert.match(result.stdout, /Open Mercato production readiness/)
     assert.match(fs.readFileSync(markdownPath, 'utf8'), /^# Open Mercato production readiness report/m)
     const report = JSON.parse(fs.readFileSync(jsonPath, 'utf8')) as { schemaVersion: number, results: unknown[] }
     assert.equal(report.schemaVersion, 1)
-    assert.equal(report.results.length, 20)
+    assert.equal(report.results.length, RULES.length)
     if (process.platform !== 'win32') {
       assert.equal(fs.statSync(markdownPath).mode & 0o777, 0o600)
       assert.equal(fs.statSync(jsonPath).mode & 0o777, 0o600)
@@ -44,8 +46,12 @@ test('infers the saved format and supports severity exit thresholds', () => {
   try {
     const saved = run([root, '--output', markdownPath])
     assert.equal(saved.status, 0, saved.stderr)
-    assert.match(saved.stdout, /^# Open Mercato production readiness report/m)
-    assert.equal(fs.readFileSync(markdownPath, 'utf8'), saved.stdout)
+    assert.equal(saved.stdout, '')
+    assert.match(fs.readFileSync(markdownPath, 'utf8'), /^# Open Mercato production readiness report/m)
+
+    const stdout = run([root, '--format', 'json', '--output', '-'])
+    assert.equal(stdout.status, 0, stdout.stderr)
+    assert.equal((JSON.parse(stdout.stdout) as { schemaVersion: number }).schemaVersion, 1)
 
     fs.rmSync(path.join(root, 'docs'), { recursive: true })
     const failing = run([root, '--fail-on', 'critical', '--no-color'])
@@ -64,5 +70,27 @@ test('returns usage error for a directory that is not an Open Mercato app', () =
     assert.match(result.stderr, /No create-mercato-app application was found/)
   } finally {
     fs.rmSync(empty, { recursive: true, force: true })
+  }
+})
+
+test('help works outside an app and diagnostics use distinct exit codes', () => {
+  const help = run(['--help'])
+  assert.equal(help.status, 0)
+  assert.match(help.stdout, /Usage:/)
+  assert.equal(help.stderr, '')
+
+  const invalidOption = run(['--unknown'])
+  assert.equal(invalidOption.status, 2)
+  assert.equal(invalidOption.stdout, '')
+  assert.match(invalidOption.stderr, /Unknown option/)
+
+  const root = makeAppFixture()
+  try {
+    const outputFailure = run([root, '--output', root])
+    assert.equal(outputFailure.status, 3)
+    assert.equal(outputFailure.stdout, '')
+    assert.match(outputFailure.stderr, /mercato-readiness:/)
+  } finally {
+    removeFixture(root)
   }
 })

@@ -37,10 +37,16 @@ node dist/cli.js scan . --format markdown --output readiness.md
 node dist/cli.js scan . --format json --output readiness.json
 ```
 
+When `--output` names a file, the CLI writes that file atomically and leaves
+stdout empty; use `--output -` for explicit stdout. The `--markdown` and `--json`
+convenience flags instead add files while retaining the formatted terminal
+report on stdout.
+
 Use `--fail-on high` (or `critical`, `medium`, or `low`) in CI to return exit
 code 1 when a failed rule meets the chosen severity. The default, `never`,
 always returns 0 after a successful scan. Invalid usage or an invalid target
-returns 2.
+returns 2; an unexpected scanner or output failure returns 3. Findings are
+rendered or saved before the exit threshold is applied.
 
 ## What the scanner does
 
@@ -67,6 +73,7 @@ also stable machine keys in the JSON report.
 | Severity | Best practice |
 |---|---|
 | Critical | [Live environment files are not tracked](docs/rules/secrets-live-env-untracked.md) |
+| Critical | [Credential and private-key files are not tracked](docs/rules/secrets-no-tracked-credentials.md) |
 | High | [Sensitive local files are ignored](docs/rules/secrets-ignore-policy.md) |
 | High | [Production configuration has a sanitized template](docs/rules/runtime-env-template.md) |
 | High | [Production build and start scripts are explicit](docs/rules/runtime-production-scripts.md) |
@@ -75,11 +82,16 @@ also stable machine keys in the JSON report.
 | High | [Browser and real-time origins are restricted](docs/rules/edge-allowed-origins.md) |
 | High | [Application security headers are configured](docs/rules/edge-security-headers.md) |
 | High | [A deployment health check is wired](docs/rules/operations-health-check.md) |
+| Critical | [Stateful services are not publicly published](docs/rules/infrastructure-private-services.md) |
 | High | [Production containers run as non-root](docs/rules/container-non-root-user.md) |
 | High | [Deployments use immutable dependency installation](docs/rules/supply-chain-immutable-install.md) |
 | Medium | [Exactly one package lockfile is committed](docs/rules/supply-chain-single-lockfile.md) |
+| High | [Multi-process deployments use shared Redis coordination](docs/rules/infrastructure-shared-redis.md) |
 | High | [Database migrations are part of release startup](docs/rules/release-database-migrations.md) |
+| High | [Production deploys select an immutable artifact](docs/rules/release-immutable-artifact.md) |
+| High | [Release validation gates the exact revision](docs/rules/release-validation-gate.md) |
 | High | [Background workers have an explicit process topology](docs/rules/operations-worker-topology.md) |
+| High | [Web and worker processes use the same release artifact](docs/rules/workers-release-parity.md) |
 | High | [Local storage is placed on persistent media](docs/rules/storage-persistent-volume.md) |
 | Critical | [Backups and restore rehearsal are documented](docs/rules/data-backup-restore-runbook.md) |
 | High | [Rollback and forward-fix procedures are documented](docs/rules/release-rollback-runbook.md) |

@@ -5,7 +5,9 @@
 
 Debugging, profiling, autologin, test injection, and browser DevTools switches
 can reveal data or weaken controls when enabled in production. The scanner checks
-only safe template defaults and never reads live environment values.
+only allowlisted boolean template defaults and never reads live environment
+values, so a safe template remains an operator-verification result rather than
+proof of the live state.
 
 ## Remediation
 

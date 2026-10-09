@@ -8,7 +8,8 @@ multi-replica deployment must not race the same migration from every instance.
 
 ## Remediation
 
-Run the supported migration command once per release before accepting traffic.
+Run the supported migration command from exactly one controlled release job
+before accepting traffic; do not let every web or worker replica race it.
 Assign ownership, capture output, take the required backup, and verify that the
 schema and application versions are compatible before scaling the web and
 worker processes.

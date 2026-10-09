@@ -45,6 +45,36 @@ test('never reads a tracked live environment file or exposes its value', () => {
   }
 })
 
+test('detects credential-like tracked paths without opening their contents', () => {
+  const root = makeAppFixture()
+  const secret = 'PRIVATE_MATERIAL_SHOULD_NOT_APPEAR_186b0e'
+  try {
+    fs.writeFileSync(path.join(root, 'deployment.pem'), secret)
+    assert.equal(readSafeText(root, 'deployment.pem'), null)
+    assert.equal(spawnSync('git', ['add', '--force', 'deployment.pem'], { cwd: root }).status, 0)
+    const report = scan(root)
+    const finding = report.results.find((result) => result.id === 'secrets-no-tracked-credentials')
+    assert.equal(finding?.status, 'fail')
+    assert.deepEqual(finding?.evidence, ['Tracked sensitive path: deployment.pem'])
+    assert.equal(JSON.stringify(report).includes(secret), false)
+  } finally {
+    removeFixture(root)
+  }
+})
+
+test('does not follow symlinks outside the scanned application', () => {
+  const root = makeAppFixture()
+  const outside = fs.mkdtempSync(path.join(path.dirname(root), 'mercato-readiness-outside-'))
+  try {
+    fs.writeFileSync(path.join(outside, 'runbook.md'), 'OUTSIDE_CONTENT_SHOULD_NOT_BE_READ')
+    fs.symlinkSync(outside, path.join(root, 'linked-docs'))
+    assert.equal(readSafeText(root, 'linked-docs/runbook.md'), null)
+  } finally {
+    removeFixture(root)
+    removeFixture(outside)
+  }
+})
+
 test('renders polished terminal, Markdown, and machine-readable JSON reports', () => {
   const root = makeAppFixture()
   try {

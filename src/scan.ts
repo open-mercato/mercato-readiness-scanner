@@ -5,13 +5,17 @@ import type { ScanReport, ScanSummary } from './types.js'
 
 export const VERSION = '0.1.0'
 
+export class InvalidTargetError extends Error {
+  override name = 'InvalidTargetError'
+}
+
 function displayName(value: string): string {
   return value.replace(/[\u0000-\u001F\u007F]/g, '?').slice(0, 160) || 'open-mercato-app'
 }
 
 export function scan(start: string, now = new Date()): ScanReport {
   const root = findAppRoot(start)
-  if (!root) throw new Error('No create-mercato-app application was found here or in a parent directory.')
+  if (!root) throw new InvalidTargetError('No create-mercato-app application was found here or in a parent directory.')
   const context = createScanContext(root)
   const results = RULES.map(({ check, ...metadata }) => {
     const outcome = check(context)

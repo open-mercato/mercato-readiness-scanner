@@ -16,10 +16,11 @@
     "node": ">=24.0.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/finalize-build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
-    "check": "npm run typecheck && npm test && npm run build"
+    "pack:check": "node scripts/check-package.mjs",
+    "check": "npm run typecheck && npm test && npm run build && npm run pack:check"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",

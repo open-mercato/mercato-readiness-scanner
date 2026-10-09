@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { collectDeploymentText, existsInside, gitTrackedFiles, readSafeText } from './files.js'
+import { collectCiText, collectDeploymentText, existsInside, gitTrackedFiles, readSafeText } from './files.js'
 import type { ScanContext } from './types.js'
 
 function readPackageJson(directory: string): Record<string, unknown> | null {
@@ -27,8 +27,9 @@ function hasOpenMercatoCore(manifest: Record<string, unknown>): boolean {
 }
 
 export function findAppRoot(start: string): string | null {
-  let current = path.resolve(start)
+  let current: string
   try {
+    current = fs.realpathSync(path.resolve(start))
     if (fs.lstatSync(current).isFile()) current = path.dirname(current)
   } catch {
     return null
@@ -52,5 +53,6 @@ export function createScanContext(root: string): ScanContext {
     exists: (relativePath) => existsInside(root, relativePath),
     readText: (relativePath) => readSafeText(root, relativePath),
     collectDeploymentText: () => collectDeploymentText(root),
+    collectCiText: () => collectCiText(root),
   }
 }

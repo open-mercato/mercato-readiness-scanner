@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import { formatJson, formatMarkdown, formatTerminal } from './formatters.js'
-import { scan, VERSION } from './scan.js'
+import { InvalidTargetError, scan, VERSION } from './scan.js'
 import type { ScanReport, Severity } from './types.js'
 
 type Format = 'terminal' | 'markdown' | 'json'
@@ -18,6 +18,10 @@ type Options = {
   failOn: Severity | 'never'
 }
 
+class CliUsageError extends Error {
+  override name = 'CliUsageError'
+}
+
 const HELP = `Open Mercato production-readiness scanner
 
 Usage:
@@ -26,7 +30,8 @@ Usage:
 
 Options:
   --format <terminal|markdown|json>  stdout format (default: terminal)
-  --output <path>                   save the selected format; .md/.json infers format
+  --output <path|->                 save the selected format; .md/.json infers format
+                                    a file suppresses stdout; - writes to stdout
   --markdown <path>                 additionally save a Markdown report
   --json <path>                     additionally save a JSON report
   --fail-on <critical|high|medium|low|never>
@@ -42,9 +47,9 @@ Examples:
   mercato-readiness scan . --format json --output readiness.json --fail-on high
 `
 
-function takeValue(args: string[], index: number, flag: string): string {
+function takeValue(args: string[], index: number, flag: string, allowDash = false): string {
   const value = args[index + 1]
-  if (!value || value.startsWith('-')) throw new Error(`${flag} requires a value.`)
+  if (!value || (value.startsWith('-') && !(allowDash && value === '-'))) throw new CliUsageError(`${flag} requires a value.`)
   args.splice(index, 2)
   return value
 }
@@ -60,24 +65,24 @@ function parseArgs(argv: string[]): Options | 'help' | 'version' {
     if (token === '--no-color') { options.color = false; args.splice(index, 1); continue }
     if (token === '--format') {
       const value = takeValue(args, index, token)
-      if (!['terminal', 'markdown', 'json'].includes(value)) throw new Error(`Unsupported format: ${value}`)
+      if (!['terminal', 'markdown', 'json'].includes(value)) throw new CliUsageError(`Unsupported format: ${value}`)
       options.format = value as Format
       options.formatExplicit = true
       continue
     }
-    if (token === '--output') { options.output = takeValue(args, index, token); continue }
+    if (token === '--output') { options.output = takeValue(args, index, token, true); continue }
     if (token === '--markdown') { options.markdown = takeValue(args, index, token); continue }
     if (token === '--json') { options.json = takeValue(args, index, token); continue }
     if (token === '--fail-on') {
       const value = takeValue(args, index, token)
-      if (!['critical', 'high', 'medium', 'low', 'never'].includes(value)) throw new Error(`Unsupported fail threshold: ${value}`)
+      if (!['critical', 'high', 'medium', 'low', 'never'].includes(value)) throw new CliUsageError(`Unsupported fail threshold: ${value}`)
       options.failOn = value as Severity | 'never'
       continue
     }
-    if (token?.startsWith('-')) throw new Error(`Unknown option: ${token}`)
+    if (token?.startsWith('-')) throw new CliUsageError(`Unknown option: ${token}`)
     index += 1
   }
-  if (args.length > 1) throw new Error('Pass at most one application path.')
+  if (args.length > 1) throw new CliUsageError('Pass at most one application path.')
   if (args[0]) options.start = args[0]
   if (options.output && !options.formatExplicit) {
     if (options.output.endsWith('.md')) options.format = 'markdown'
@@ -109,19 +114,22 @@ function shouldFail(report: ScanReport, threshold: Severity | 'never'): boolean 
 export function main(argv = process.argv.slice(2)): number {
   try {
     const parsed = parseArgs(argv)
-    if (parsed === 'help') { process.stdout.write(HELP); return 0 }
-    if (parsed === 'version') { process.stdout.write(`${VERSION}\n`); return 0 }
+    if (parsed === 'help') { fs.writeSync(process.stdout.fd, HELP); return 0 }
+    if (parsed === 'version') { fs.writeSync(process.stdout.fd, `${VERSION}\n`); return 0 }
     const report = scan(parsed.start)
     const stdout = render(report, parsed.format, parsed.color)
-    process.stdout.write(stdout)
-    if (parsed.output) writeReport(parsed.output, stdout)
+    if (!parsed.output || parsed.output === '-') fs.writeSync(process.stdout.fd, stdout)
+    else writeReport(parsed.output, stdout)
     if (parsed.markdown) writeReport(parsed.markdown, formatMarkdown(report))
     if (parsed.json) writeReport(parsed.json, formatJson(report))
     return shouldFail(report, parsed.failOn) ? 1 : 0
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    process.stderr.write(`mercato-readiness: ${message}\n`)
-    return 2
+    try {
+      fs.writeSync(process.stderr.fd, `mercato-readiness: ${message}\n`)
+    } catch {
+    }
+    return error instanceof CliUsageError || error instanceof InvalidTargetError ? 2 : 3
   }
 }
 

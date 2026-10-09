@@ -5,7 +5,8 @@
 
 The standard `/api/healthz` endpoint lets the platform remove an unhealthy
 release and lets operators monitor availability. Merely having the framework
-route is insufficient if the deployment platform does not probe it.
+route is insufficient if the deployment platform does not probe it or dependency
+failures still return a healthy response.
 
 ## Remediation
 

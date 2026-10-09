@@ -5,7 +5,8 @@
 
 A release-specific `.env.example` makes required configuration names auditable
 without exposing live values. The scanner expects the core production settings
-`NODE_ENV`, `APP_URL`, and `DATABASE_URL` to be represented.
+`NODE_ENV`, `APP_URL`, `DATABASE_URL`, `INTERNAL_APP_ORIGIN`, and
+`PLATFORM_PRIMARY_HOST` to be represented.
 
 ## Remediation
 

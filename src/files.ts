@@ -28,9 +28,28 @@ function resolveInside(root: string, relativePath: string): string | null {
   return absolute
 }
 
+function resolvesWithinRoot(root: string, absolute: string): boolean {
+  try {
+    const realRoot = fs.realpathSync(root)
+    const realTarget = fs.realpathSync(absolute)
+    const relation = path.relative(realRoot, realTarget)
+    return relation !== '..' && !relation.startsWith(`..${path.sep}`) && !path.isAbsolute(relation)
+  } catch {
+    return false
+  }
+}
+
 function isForbiddenEnv(relativePath: string): boolean {
   const basename = path.posix.basename(normalized(relativePath)).toLowerCase()
   return (basename === '.env' || basename.startsWith('.env.')) && !SAFE_ENV_TEMPLATES.has(basename)
+}
+
+function isForbiddenCredential(relativePath: string): boolean {
+  const normalizedPath = normalized(relativePath)
+  const basename = path.posix.basename(normalizedPath).toLowerCase()
+  return /\.(?:pem|key|p12|pfx|jks)$/i.test(basename)
+    || ['id_rsa', 'id_ed25519', '.mcp.json', '.npmrc'].includes(basename)
+    || /(?:^|\/)\.(?:codex|cursor)\/mcp\.json$/i.test(normalizedPath)
 }
 
 export function existsInside(root: string, relativePath: string): boolean {
@@ -38,19 +57,19 @@ export function existsInside(root: string, relativePath: string): boolean {
   if (!absolute) return false
   try {
     const stat = fs.lstatSync(absolute)
-    return !stat.isSymbolicLink()
+    return !stat.isSymbolicLink() && resolvesWithinRoot(root, absolute)
   } catch {
     return false
   }
 }
 
 export function readSafeText(root: string, relativePath: string): string | null {
-  if (isForbiddenEnv(relativePath)) return null
+  if (isForbiddenEnv(relativePath) || isForbiddenCredential(relativePath)) return null
   const absolute = resolveInside(root, relativePath)
   if (!absolute) return null
   try {
     const stat = fs.lstatSync(absolute)
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_TEXT_BYTES) return null
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_TEXT_BYTES || !resolvesWithinRoot(root, absolute)) return null
     return fs.readFileSync(absolute, 'utf8')
   } catch {
     return null
@@ -69,9 +88,14 @@ export function gitTrackedFiles(root: string): ReadonlySet<string> | null {
   return new Set(result.stdout.split('\0').filter(Boolean).map(normalized))
 }
 
-function collectDocs(root: string): string[] {
-  const docsRoot = resolveInside(root, 'docs')
+function collectTextFiles(root: string, relativeRoot: string, allowed: RegExp): string[] {
+  const docsRoot = resolveInside(root, relativeRoot)
   if (!docsRoot || !fs.existsSync(docsRoot)) return []
+  try {
+    if (fs.lstatSync(docsRoot).isSymbolicLink() || !resolvesWithinRoot(root, docsRoot)) return []
+  } catch {
+    return []
+  }
   const found: string[] = []
   let visitedDirectories = 0
   const visit = (directory: string, depth: number): void => {
@@ -87,7 +111,7 @@ function collectDocs(root: string): string[] {
       if (entry.isSymbolicLink()) continue
       const absolute = path.join(directory, entry.name)
       if (entry.isDirectory()) visit(absolute, depth + 1)
-      else if (entry.isFile() && /\.(?:md|mdx|txt)$/i.test(entry.name)) found.push(normalized(path.relative(root, absolute)))
+      else if (entry.isFile() && allowed.test(entry.name)) found.push(normalized(path.relative(root, absolute)))
       if (found.length >= 200) return
     }
   }
@@ -96,7 +120,12 @@ function collectDocs(root: string): string[] {
 }
 
 export function collectDeploymentText(root: string): string {
-  const files = [...DEPLOYMENT_FILES, ...collectDocs(root)]
+  const files = [...DEPLOYMENT_FILES, ...collectTextFiles(root, 'docs', /\.(?:md|mdx|txt)$/i)]
+  return files.map((file) => readSafeText(root, file)).filter((value): value is string => value !== null).join('\n')
+}
+
+export function collectCiText(root: string): string {
+  const files = collectTextFiles(root, '.github/workflows', /\.(?:yml|yaml)$/i)
   return files.map((file) => readSafeText(root, file)).filter((value): value is string => value !== null).join('\n')
 }
 

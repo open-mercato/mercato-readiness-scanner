@@ -31,14 +31,33 @@ function dependencies(context: ScanContext): ReadonlySet<string> {
   return new Set(names)
 }
 
-function templateKeys(context: ScanContext): Map<string, string> {
+type TemplateInventory = {
+  names: ReadonlySet<string>
+  booleans: ReadonlyMap<string, boolean>
+  integers: ReadonlyMap<string, number>
+  enums: ReadonlyMap<string, string>
+}
+
+function templateInventory(context: ScanContext): TemplateInventory {
   const source = context.readText('.env.example') ?? ''
-  const entries = new Map<string, string>()
+  const names = new Set<string>()
+  const booleans = new Map<string, boolean>()
+  const integers = new Map<string, number>()
+  const enums = new Map<string, string>()
   for (const line of source.split(/\r?\n/)) {
     const match = line.match(/^([A-Z][A-Z0-9_]*)=(.*)$/)
-    if (match?.[1] !== undefined && match[2] !== undefined) entries.set(match[1], match[2].trim())
+    if (match?.[1] === undefined || match[2] === undefined) continue
+    const key = match[1]
+    const rawValue = match[2].trim()
+    names.add(key)
+    if (/(?:DEBUG|PROFILE|DEVTOOLS|AUTOLOGIN|TEST_INJECT|DEMO_MODE|EMERGENCY_BYPASS|INTEGRATION_TEST|AUTO_SPAWN_WORKERS)/.test(key)) {
+      if (/^(?:1|true|yes|on)$/i.test(rawValue)) booleans.set(key, true)
+      if (/^(?:0|false|no|off)$/i.test(rawValue)) booleans.set(key, false)
+    }
+    if (key === 'RATE_LIMIT_TRUST_PROXY_DEPTH' && /^-?\d+$/.test(rawValue)) integers.set(key, Number(rawValue))
+    if (key === 'CACHE_STRATEGY' && /^(?:redis|memory|sqlite)$/i.test(rawValue)) enums.set(key, rawValue.toLowerCase())
   }
-  return entries
+  return { names, booleans, integers, enums }
 }
 
 function containsAll(source: string, values: string[]): boolean {
@@ -51,6 +70,61 @@ function fileEvidence(paths: string[]): string[] {
 
 function displayPath(value: string): string {
   return value.replace(/[\u0000-\u001F\u007F]/g, '?').slice(0, 240)
+}
+
+function ignorePatterns(context: ScanContext): ReadonlySet<string> {
+  const source = context.readText('.gitignore') ?? ''
+  return new Set(source.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#')))
+}
+
+function trackedCredentialPath(relativePath: string): boolean {
+  const normalized = relativePath.replaceAll('\\', '/')
+  const basename = normalized.split('/').at(-1)?.toLowerCase() ?? ''
+  return /\.(?:pem|key|p12|pfx|jks)$/i.test(basename)
+    || ['id_rsa', 'id_ed25519', '.mcp.json', '.npmrc'].includes(basename)
+    || /(?:^|\/)\.(?:codex|cursor)\/mcp\.json$/i.test(normalized)
+}
+
+function composePublicBindings(context: ScanContext): string[] {
+  const findings: string[] = []
+  for (const file of ['docker-compose.yml', 'docker-compose.fullapp.yml']) {
+    const source = context.readText(file)
+    if (!source) continue
+    const lines = source.split(/\r?\n/)
+    let service: string | null = null
+    let portsIndent = -1
+    for (const line of lines) {
+      const serviceMatch = line.match(/^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)
+      if (serviceMatch?.[1]) {
+        service = serviceMatch[1]
+        portsIndent = -1
+        continue
+      }
+      if (!service || !/(?:postgres|redis|search|opensearch|elastic|meili)/i.test(service)) continue
+      const indent = line.length - line.trimStart().length
+      if (/^\s+ports:\s*(?:#.*)?$/.test(line)) {
+        portsIndent = indent
+        continue
+      }
+      if (portsIndent >= 0 && indent <= portsIndent && line.trim()) portsIndent = -1
+      if (portsIndent < 0) continue
+      const binding = line.match(/^\s+-\s*["']?([^"'#]+)["']?/)?.[1]?.trim()
+      if (!binding || /^(?:127\.0\.0\.1|localhost):/.test(binding)) continue
+      findings.push(`${file}: ${service} publishes ${displayPath(binding)}`)
+    }
+  }
+  return findings
+}
+
+function workerDockerfiles(context: ScanContext): string[] {
+  const values: string[] = []
+  for (const file of ['railway.toml', 'railway.worker.toml']) {
+    const source = context.readText(file)
+    if (!source) continue
+    const configured = source.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1]
+    values.push(configured ? displayPath(configured) : 'Dockerfile')
+  }
+  return values
 }
 
 export const RULES: readonly RuleDefinition[] = [
@@ -66,13 +140,24 @@ export const RULES: readonly RuleDefinition[] = [
     },
   }),
   rule({
+    id: 'secrets-no-tracked-credentials', title: 'Credential and private-key files are not tracked', category: 'Secrets', severity: 'critical',
+    remediation: 'Remove tracked credential or private-key files, revoke or rotate the material, and store it in an access-controlled secret manager.',
+    check: (context) => {
+      if (!context.trackedFiles) return { status: 'warning', summary: 'Git tracking could not be inspected; verify that no credential or private-key file is committed.' }
+      const tracked = [...context.trackedFiles].filter(trackedCredentialPath)
+      return tracked.length
+        ? { status: 'fail', summary: 'Credential-like or private-key paths are tracked.', evidence: tracked.map((file) => `Tracked sensitive path: ${displayPath(file)}`) }
+        : { status: 'pass', summary: 'No recognized credential or private-key path is tracked.' }
+    },
+  }),
+  rule({
     id: 'secrets-ignore-policy', title: 'Sensitive local files are ignored', category: 'Secrets', severity: 'high',
     remediation: 'Ignore live .env files, private keys, local MCP credentials, npm credentials, and raw agent session exports.',
     check: (context) => {
-      const source = context.readText('.gitignore')
-      if (!source) return { status: 'fail', summary: 'No readable .gitignore defines a sensitive-file policy.' }
-      const required = ['.env', '*.pem', '.mcp.json', '.npmrc', '.ai/session-exports/']
-      const missing = required.filter((pattern) => !source.includes(pattern))
+      const patterns = ignorePatterns(context)
+      if (!patterns.size) return { status: 'fail', summary: 'No readable .gitignore defines a sensitive-file policy.' }
+      const required = ['.env', '.env.production', '.env.local', '.env.*.local', '*.pem', '*.key', '.mcp.json', '.npmrc', '.ai/session-exports/']
+      const missing = required.filter((pattern) => !patterns.has(pattern))
       return missing.length === 0
         ? { status: 'pass', summary: 'The ignore policy covers common Open Mercato secret and session artifacts.' }
         : { status: 'fail', summary: 'The ignore policy misses sensitive local artifacts.', evidence: missing.map((pattern) => `Missing ignore coverage: ${pattern}`) }
@@ -83,8 +168,8 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Keep a sanitized .env.example with configuration names and safe placeholders for the exact app release.',
     check: (context) => {
       if (!context.exists('.env.example')) return { status: 'fail', summary: 'The application has no .env.example template.' }
-      const keys = templateKeys(context)
-      const missing = ['NODE_ENV', 'APP_URL', 'DATABASE_URL'].filter((key) => !keys.has(key))
+      const inventory = templateInventory(context)
+      const missing = ['NODE_ENV', 'APP_URL', 'DATABASE_URL', 'INTERNAL_APP_ORIGIN', 'PLATFORM_PRIMARY_HOST'].filter((key) => !inventory.names.has(key))
       return missing.length === 0
         ? { status: 'pass', summary: 'The sanitized environment template names the core production settings.' }
         : { status: 'fail', summary: 'The environment template omits core production settings.', evidence: missing.map((key) => `Missing template key: ${key}`) }
@@ -115,20 +200,24 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'edge-trusted-proxy-depth', title: 'Trusted proxy depth is topology-specific', category: 'Edge', severity: 'high',
     remediation: 'Set RATE_LIMIT_TRUST_PROXY_DEPTH to the exact number of trusted proxy hops and never trust arbitrary forwarded headers.',
-    check: (context) => templateKeys(context).has('RATE_LIMIT_TRUST_PROXY_DEPTH')
-      ? { status: 'warning', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH is documented; verify its live value matches the deployed proxy chain.' }
-      : { status: 'fail', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH is absent from the configuration template.' },
+    check: (context) => {
+      const inventory = templateInventory(context)
+      if (!inventory.names.has('RATE_LIMIT_TRUST_PROXY_DEPTH')) return { status: 'fail', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH is absent from the configuration template.' }
+      const depth = inventory.integers.get('RATE_LIMIT_TRUST_PROXY_DEPTH')
+      if (depth !== undefined && depth < 0) return { status: 'fail', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH cannot be negative.' }
+      return { status: 'warning', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH is documented; verify its live value matches the deployed proxy chain.' }
+    },
   }),
   rule({
     id: 'edge-allowed-origins', title: 'Browser and real-time origins are restricted', category: 'Edge', severity: 'high',
     remediation: 'Configure APP_ALLOWED_ORIGINS and capability-specific origin lists with only intended HTTPS origins.',
     check: (context) => {
-      const keys = templateKeys(context)
+      const inventory = templateInventory(context)
       const required = ['APP_ALLOWED_ORIGINS']
       const installed = dependencies(context)
       if (installed.has('@open-mercato/checkout')) required.push('CHECKOUT_ALLOWED_ORIGINS')
       if (installed.has('@open-mercato/documents')) required.push('DOCUMENTS_COLLAB_ALLOWED_ORIGINS')
-      const missing = required.filter((key) => !keys.has(key))
+      const missing = required.filter((key) => !inventory.names.has(key))
       return missing.length
         ? { status: 'fail', summary: 'Origin allowlist configuration is incomplete.', evidence: missing.map((key) => `Missing template key: ${key}`) }
         : { status: 'warning', summary: 'Origin allowlist keys are present; verify that live values contain only intended HTTPS origins.' }
@@ -139,11 +228,12 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Keep the shared CSP and security headers in next.config.ts and verify that the public edge preserves them.',
     check: (context) => {
       const source = context.readText('next.config.ts') ?? context.readText('next.config.mjs') ?? ''
-      const required = ['Content-Security-Policy', 'Strict-Transport-Security', 'X-Content-Type-Options']
+      const required = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options']
       const missing = required.filter((header) => !source.includes(header))
+      if (!/X-Frame-Options|frame-ancestors/.test(source)) missing.push('frame protection')
       return missing.length
         ? { status: 'fail', summary: 'The application configuration does not declare the complete security-header baseline.', evidence: missing.map((header) => `Missing header: ${header}`) }
-        : { status: 'pass', summary: 'The application declares CSP, HSTS, and MIME-sniffing protection headers.' }
+        : { status: 'pass', summary: 'The application declares CSP, referrer, frame, and MIME-sniffing protection headers.' }
     },
   }),
   rule({
@@ -152,9 +242,21 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const route = dependencies(context).has('@open-mercato/core') || context.exists('src/app/api/healthz/route.ts')
       const configured = /\/api\/healthz/.test(context.collectDeploymentText())
-      if (route && configured) return { status: 'pass', summary: 'The health route exists and deployment configuration references it.' }
+      if (route && configured) return { status: 'warning', summary: 'The health route is wired; verify bounded dependency-failure and recovery behavior in the deployed environment.' }
       const evidence = [!route ? 'Missing src/app/api/healthz/route.ts.' : '', !configured ? 'Deployment configuration does not reference /api/healthz.' : ''].filter(Boolean)
       return { status: 'fail', summary: 'Health-check wiring is incomplete.', evidence }
+    },
+  }),
+  rule({
+    id: 'infrastructure-private-services', title: 'Stateful services are not publicly published', category: 'Infrastructure', severity: 'critical',
+    remediation: 'Remove public host bindings for PostgreSQL, Redis, and search services; use private networks or an authenticated operator tunnel.',
+    check: (context) => {
+      const composePresent = context.exists('docker-compose.yml') || context.exists('docker-compose.fullapp.yml')
+      if (!composePresent) return { status: 'skipped', summary: 'No recognized in-repository Compose topology was found; verify provider networking separately.' }
+      const findings = composePublicBindings(context)
+      return findings.length
+        ? { status: 'fail', summary: 'Stateful services have non-loopback host port bindings.', evidence: findings }
+        : { status: 'pass', summary: 'No public host binding was found for recognized stateful services.' }
     },
   }),
   rule({
@@ -187,11 +289,60 @@ export const RULES: readonly RuleDefinition[] = [
     },
   }),
   rule({
+    id: 'infrastructure-shared-redis', title: 'Multi-process deployments use shared Redis coordination', category: 'Infrastructure', severity: 'high',
+    remediation: 'Use shared Redis-backed cache, events, and asynchronous queues whenever web and worker processes run separately.',
+    check: (context) => {
+      const hasWorker = ['railway.worker.toml', 'scripts/railway-worker.sh'].some(context.exists)
+      if (!hasWorker) return { status: 'skipped', summary: 'No separate worker process was detected.' }
+      const inventory = templateInventory(context)
+      const strategy = inventory.enums.get('CACHE_STRATEGY')
+      const redisNamed = ['REDIS_URL', 'CACHE_REDIS_URL', 'EVENTS_REDIS_URL'].some((key) => inventory.names.has(key))
+      if (strategy && strategy !== 'redis') return { status: 'fail', summary: `The template selects ${strategy} cache coordination for a multi-process topology.` }
+      if (strategy === 'redis' && redisNamed) return { status: 'warning', summary: 'Shared Redis configuration is represented; verify every live process uses the same service.' }
+      return { status: 'fail', summary: 'A separate worker exists without a complete shared Redis configuration surface.' }
+    },
+  }),
+  rule({
     id: 'release-database-migrations', title: 'Database migrations are part of release startup', category: 'Release', severity: 'high',
     remediation: 'Run the supported database migration command once per release before accepting traffic.',
     check: (context) => /(?:db[: ]migrate|mercato\s+db\s+migrate)/i.test(context.collectDeploymentText())
-      ? { status: 'pass', summary: 'Deployment configuration includes a database migration step.' }
+      ? { status: 'warning', summary: 'A migration path exists; verify exactly one controlled release job can execute it.' }
       : { status: 'fail', summary: 'No database migration step was found in deployment configuration.' },
+  }),
+  rule({
+    id: 'release-immutable-artifact', title: 'Production deploys select an immutable artifact', category: 'Release', severity: 'high',
+    remediation: 'Build once, identify the artifact by digest or commit SHA, and retain the prior compatible artifact for rollback.',
+    check: (context) => {
+      const source = ['docker-compose.yml', 'docker-compose.fullapp.yml', 'railway.toml', 'railway.worker.toml']
+        .map((file) => context.readText(file) ?? '').join('\n')
+      const images = [...source.matchAll(/^\s*image\s*[:=]\s*["']?([^\s"']+)/gmi)].map((match) => match[1] ?? '')
+      if (!images.length) return { status: 'warning', summary: 'No in-repository production image reference proves immutable artifact selection.' }
+      const mutable = images.filter((image) => /:latest$|:(?:main|master|develop|dev)$/i.test(image))
+      if (mutable.length) return { status: 'fail', summary: 'Production configuration uses mutable image references.', evidence: mutable.map((image) => `Mutable image reference: ${displayPath(image)}`) }
+      const unpinned = images.filter((image) => !/@sha256:[a-f0-9]{64}$/i.test(image) && !/:[a-f0-9]{7,40}$/i.test(image) && !/github\.sha/i.test(image))
+      return unpinned.length
+        ? { status: 'warning', summary: 'Image references exist, but the scanner cannot prove they are immutable.', evidence: unpinned.map((image) => `Review image reference: ${displayPath(image)}`) }
+        : { status: 'pass', summary: 'Production image references use a digest or commit-derived identifier.' }
+    },
+  }),
+  rule({
+    id: 'release-validation-gate', title: 'Release validation gates the exact revision', category: 'Release', severity: 'high',
+    remediation: 'Make generation, production build, tests, and migration verification blocking steps for the exact release revision.',
+    check: (context) => {
+      const source = context.collectCiText()
+      if (!source) return { status: 'warning', summary: 'No recognized in-repository CI workflow was found; verify the external release gate.' }
+      const required = [
+        ['generation', /(?:yarn|npm|pnpm).*\bgenerate\b/i],
+        ['production build', /(?:yarn|npm|pnpm).*\bbuild\b/i],
+        ['tests', /(?:yarn|npm|pnpm).*\btest\b/i],
+        ['migration verification', /migrat/i],
+      ] as const
+      const missing = required.filter(([, pattern]) => !pattern.test(source)).map(([name]) => name)
+      if (/continue-on-error:\s*true/i.test(source)) return { status: 'fail', summary: 'The CI workflow contains a permissive continue-on-error step that requires review.' }
+      return missing.length
+        ? { status: 'fail', summary: 'The release validation workflow is incomplete.', evidence: missing.map((name) => `Missing blocking stage: ${name}`) }
+        : { status: 'pass', summary: 'CI represents generation, build, tests, and migration verification.' }
+    },
   }),
   rule({
     id: 'operations-worker-topology', title: 'Background workers have an explicit process topology', category: 'Operations', severity: 'high',
@@ -202,6 +353,18 @@ export const RULES: readonly RuleDefinition[] = [
       return paths.length
         ? { status: 'pass', summary: 'An explicit worker deployment surface is present.', evidence: fileEvidence(paths) }
         : { status: 'fail', summary: 'The queue package is installed but no worker deployment surface was found.' }
+    },
+  }),
+  rule({
+    id: 'workers-release-parity', title: 'Web and worker processes use the same release artifact', category: 'Operations', severity: 'high',
+    remediation: 'Deploy one immutable build to web and worker roles and vary only the supported entrypoint.',
+    check: (context) => {
+      if (!context.exists('railway.worker.toml') && !context.exists('scripts/railway-worker.sh')) return { status: 'skipped', summary: 'No separate worker process was detected.' }
+      const dockerfiles = workerDockerfiles(context)
+      if (dockerfiles.length < 2) return { status: 'warning', summary: 'Worker deployment exists, but artifact parity is controlled outside recognized repository files.' }
+      return new Set(dockerfiles).size === 1
+        ? { status: 'pass', summary: 'Web and worker deployment definitions use the same Dockerfile.', evidence: [`Shared build definition: ${dockerfiles[0]}`] }
+        : { status: 'fail', summary: 'Web and worker deployment definitions use different build artifacts.', evidence: dockerfiles.map((file) => `Build definition: ${file}`) }
     },
   }),
   rule({
@@ -237,9 +400,9 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'observability-telemetry-pipeline', title: 'Logs and telemetry have a production pipeline', category: 'Observability', severity: 'medium',
     remediation: 'Configure structured log collection plus an OTLP/APM backend, retention, alerts, and redaction checks.',
     check: (context) => {
-      const keys = templateKeys(context)
+      const inventory = templateInventory(context)
       const config = ['docker/otel-collector-config.yaml', 'docker/otel-collector-config.yml'].filter(context.exists)
-      const hasSetting = [...keys.keys()].some((key) => /^(?:OTEL_|NEW_RELIC_|SENTRY_)/.test(key))
+      const hasSetting = [...inventory.names].some((key) => /^(?:OTEL_|NEW_RELIC_|SENTRY_)/.test(key))
       if (config.length && hasSetting) return { status: 'warning', summary: 'Telemetry configuration is present; verify live ingestion, alerts, retention, and redaction.', evidence: fileEvidence(config) }
       return { status: 'fail', summary: 'A production telemetry pipeline is not represented in the application configuration.' }
     },
@@ -259,9 +422,12 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'runtime-debug-features-disabled', title: 'Development-only features default off', category: 'Runtime', severity: 'high',
     remediation: 'Keep debug, profiling, autologin, test injection, and DevTools switches disabled in the production template.',
     check: (context) => {
-      const risky = [...templateKeys(context)].filter(([key, value]) => /(?:DEBUG|PROFILE|DEVTOOLS|AUTOLOGIN|TEST_INJECT)/.test(key) && /^(?:1|true|yes|on)$/i.test(value)).map(([key]) => key)
+      const inventory = templateInventory(context)
+      const risky = [...inventory.booleans].filter(([, enabled]) => enabled).map(([key]) => key)
+      const autologin = [...inventory.names].filter((key) => /AUTOLOGIN/.test(key))
+      risky.push(...autologin.filter((key) => !risky.includes(key)))
       return risky.length === 0
-        ? { status: 'pass', summary: 'No development-only switch defaults to enabled in .env.example.' }
+        ? { status: 'warning', summary: 'No development-only switch defaults to enabled in .env.example; verify the live environment separately.' }
         : { status: 'fail', summary: 'Development-only switches default to enabled.', evidence: risky.map((key) => `Enabled template switch: ${key}`) }
     },
   }),
