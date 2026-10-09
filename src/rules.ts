@@ -800,11 +800,12 @@ function escapedIdentifier(identifier: string): string {
   return identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-function singleArrayElement(source: string): string | null {
+function arrayElements(source: string): string[] | null {
   const depths = { brace: 0, bracket: 0, parenthesis: 0 }
   let quote = ''
   let escaped = false
-  let separator = -1
+  let elementStart = 0
+  const elements: string[] = []
   for (let index = 0; index < source.length; index += 1) {
     const character = source[index] ?? ''
     if (quote) {
@@ -824,30 +825,99 @@ function singleArrayElement(source: string): string | null {
     else if (character === '(') depths.parenthesis += 1
     else if (character === ')') depths.parenthesis -= 1
     else if (character === ',' && depths.brace === 0 && depths.bracket === 0 && depths.parenthesis === 0) {
-      if (separator >= 0) return null
-      separator = index
+      elements.push(source.slice(elementStart, index).trim())
+      elementStart = index + 1
     }
     if (depths.brace < 0 || depths.bracket < 0 || depths.parenthesis < 0) return null
   }
   if (quote || depths.brace !== 0 || depths.bracket !== 0 || depths.parenthesis !== 0) return null
-  if (separator < 0) return source.trim() || null
-  if (source.slice(separator + 1).trim()) return null
-  return source.slice(0, separator).trim() || null
+  const tail = source.slice(elementStart).trim()
+  if (tail || elementStart === 0) elements.push(tail)
+  if (elements.length === 1 && elements[0] === '' && source.trim() === '') return []
+  return elements
 }
 
-function coercesToHeadersKey(expression: string): boolean {
+function constantStringValue(expression: string): string | null {
+  const quote = expression[0] ?? ''
+  if (!['"', "'", '`'].includes(quote) || expression.at(-1) !== quote) return null
+  const body = expression.slice(1, -1)
+  let value = ''
+  for (let index = 0; index < body.length; index += 1) {
+    const character = body[index] ?? ''
+    if (quote === '`' && character === '$' && body[index + 1] === '{') return null
+    if (character === quote) return null
+    if (character !== '\\') {
+      value += character
+      continue
+    }
+    const escaped = body[index + 1]
+    if (escaped === undefined) return null
+    index += 1
+    if (escaped === '\n') continue
+    if (escaped === '\r') {
+      if (body[index + 1] === '\n') index += 1
+      continue
+    }
+    if (escaped === 'x') {
+      const digits = body.slice(index + 1, index + 3)
+      if (!/^[0-9a-f]{2}$/i.test(digits)) return null
+      value += String.fromCodePoint(Number.parseInt(digits, 16))
+      index += 2
+      continue
+    }
+    if (escaped === 'u') {
+      if (body[index + 1] === '{') {
+        const closing = body.indexOf('}', index + 2)
+        if (closing < 0) return null
+        const digits = body.slice(index + 2, closing)
+        if (!/^[0-9a-f]{1,6}$/i.test(digits)) return null
+        const codePoint = Number.parseInt(digits, 16)
+        if (codePoint > 0x10ffff) return null
+        value += String.fromCodePoint(codePoint)
+        index = closing
+      } else {
+        const digits = body.slice(index + 1, index + 5)
+        if (!/^[0-9a-f]{4}$/i.test(digits)) return null
+        value += String.fromCodePoint(Number.parseInt(digits, 16))
+        index += 4
+      }
+      continue
+    }
+    const simpleEscapes: Record<string, string> = {
+      b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v', 0: '\0',
+    }
+    if (escaped === '0' && /[0-9]/.test(body[index + 1] ?? '')) return null
+    if (/[1-9]/.test(escaped)) return null
+    value += simpleEscapes[escaped] ?? escaped
+  }
+  return value
+}
+
+function constantPropertyKey(expression: string): string | null {
   let candidate = expression.trim()
   while (candidate.startsWith('(')) {
     const body = extractDelimitedBody(candidate, 0, '(', ')')
     if (body === null || body.length + 2 !== candidate.length) break
     candidate = body.trim()
   }
-  if (/^(?:["']headers["']|`headers`)$/.test(candidate)) return true
-  if (!candidate.startsWith('[')) return false
+  const stringValue = constantStringValue(candidate)
+  if (stringValue !== null) return stringValue
+  if (!candidate.startsWith('[')) return null
   const body = extractDelimitedBody(candidate, 0, '[', ']')
-  if (body === null || body.length + 2 !== candidate.length) return false
-  const element = singleArrayElement(body)
-  return element !== null && coercesToHeadersKey(element)
+  if (body === null || body.length + 2 !== candidate.length) return null
+  const elements = arrayElements(body)
+  if (elements === null) return null
+  const values: string[] = []
+  for (const element of elements) {
+    if (!element) {
+      values.push('')
+      continue
+    }
+    const value = constantPropertyKey(element)
+    if (value === null) return null
+    values.push(value)
+  }
+  return values.join(',')
 }
 
 function callArgument(source: string, start: number): string | null {
@@ -890,7 +960,9 @@ function hasCoercedHeaderMutation(source: string, identifier: string): boolean {
   ]
   return patterns.some((pattern) => [...source.matchAll(pattern)].some((match) => {
     const argument = callArgument(source, (match.index ?? 0) + match[0].length)
-    return argument !== null && coercesToHeadersKey(argument)
+    if (argument === null) return true
+    const propertyKey = constantPropertyKey(argument)
+    return propertyKey === null || propertyKey === 'headers'
   }))
 }
 
