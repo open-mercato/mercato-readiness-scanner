@@ -253,6 +253,14 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
     overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; config.images = { remotePatterns: [] }; export default config\n`)
     assert.equal(scan(root).get('edge-security-headers')?.status, 'pass')
+    overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; Object.defineProperties(config, { ["headers"]: { value: undefined } }); export default config\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; Reflect.defineProperty(config, "headers", { value: undefined }); export default config\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; Object.defineProperty(config, \`headers\`, { value: undefined }); export default config\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; delete config["images"]; export default config\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'pass')
 
     const validTemplate = fs.readFileSync(path.join(root, '.env.example'), 'utf8')
     overwrite(root, '.env.example', validTemplate.replace('RATE_LIMIT_TRUST_PROXY_DEPTH=1', 'RATE_LIMIT_TRUST_PROXY_DEPTH=unbounded'))
@@ -298,9 +306,17 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     assert.equal(scan(root).get('edge-tls-and-canonical-origin')?.status, 'fail')
     assert.equal(scan(root).get('data-backup-restore-runbook')?.status, 'fail')
     assert.equal(scan(root).get('release-rollback-runbook')?.status, 'fail')
+    for (const source of ['TLS is disabled.\nBackup is disabled and restore is impossible.\nRollback is disabled.\n', "TLS isn't configured.\nBackup isn't available and restore isn't tested.\nRollback isn't documented.\n"]) {
+      overwrite(root, 'docs/operations.md', source)
+      assert.equal(scan(root).get('edge-tls-and-canonical-origin')?.status, 'fail', source)
+      assert.equal(scan(root).get('data-backup-restore-runbook')?.status, 'fail', source)
+      assert.equal(scan(root).get('release-rollback-runbook')?.status, 'fail', source)
+    }
 
     overwrite(root, 'railway.toml', '[deploy]\nstartCommand = "command /bin/false && yarn db:migrate"\n')
     assert.equal(scan(root).get('release-database-migrations')?.status, 'fail')
+    overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci && echo npm install\nUSER app\n')
+    assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'pass')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
     assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'fail')

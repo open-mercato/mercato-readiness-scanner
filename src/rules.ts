@@ -648,14 +648,12 @@ function dependencyMutation(command: string): DependencyMutation | null {
     .replace(/^[A-Za-z][\w.-]*(?:Command|command)\s*=\s*["']?/i, '')
     .replace(/^["']/, '')
     .replace(/^[({]+\s*/, '')
-    .replace(/^(?:exec\s+|sudo\s+|env\s+|corepack\s+)+/i, '')
+    .replace(/^(?:(?:exec|sudo|env|command|corepack)\s+)+/i, '')
     .replace(/^(?:(?:[A-Za-z_][A-Za-z0-9_]*)=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)+/, '')
-    .replace(/^(?:exec\s+|sudo\s+|corepack\s+)+/i, '')
+    .replace(/^(?:(?:exec|sudo|command|corepack)\s+)+/i, '')
     .trim()
   const match = normalized.match(/^(npm|yarn|pnpm)\s+([^\s"']+)([^\n]*)/i)
-  if (!match?.[1] || !match[2]) {
-    return /\b(?:npm|yarn|pnpm)\b[^\n;&|]*\b(?:ci|install|i|add|update|up|upgrade)\b/i.test(normalized) ? 'mutable' : null
-  }
+  if (!match?.[1] || !match[2]) return null
   const manager = match[1].toLowerCase()
   const action = match[2].toLowerCase()
   const args = match[3] ?? ''
@@ -840,12 +838,14 @@ function exportedConfigObject(source: string): { body: string, start: number } |
   if (body === null) return null
   const afterObject = source.slice(openingBrace + body.length + 2)
   const identifierPattern = escapedIdentifier(identifier)
+  const headerKeyPattern = '(?:["\']headers["\']|`headers`|[A-Za-z_$][\\w$]*)'
   const mutation = new RegExp([
-    `\\b${identifierPattern}\\s*(?:\\.\\s*headers|\\[\\s*(?:["']headers["']|[A-Za-z_$][\\w$]*)\\s*])\\s*=`,
-    `\\bdelete\\s+${identifierPattern}\\s*(?:\\.\\s*headers|\\[[^\\]]+])`,
-    `\\bObject\\s*\\.\\s*assign\\s*\\(\\s*${identifierPattern}\\s*,\\s*\\{[^)]*(?:\\bheaders\\s*:|\\[)`,
-    `\\bObject\\s*\\.\\s*definePropert(?:y|ies)\\s*\\(\\s*${identifierPattern}\\s*,\\s*(?:["']headers["']|[A-Za-z_$][\\w$]*|\\{[^)]*\\bheaders\\s*:)`,
-    `\\bReflect\\s*\\.\\s*set\\s*\\(\\s*${identifierPattern}\\s*,\\s*(?:["']headers["']|[A-Za-z_$][\\w$]*)`,
+    `\\b${identifierPattern}\\s*(?:\\.\\s*headers|\\[\\s*${headerKeyPattern}\\s*])\\s*=`,
+    `\\bdelete\\s+${identifierPattern}\\s*(?:\\.\\s*headers|\\[\\s*${headerKeyPattern}\\s*])`,
+    `\\bObject\\s*\\.\\s*assign\\s*\\(\\s*${identifierPattern}\\s*,\\s*\\{[^)]*(?:\\bheaders\\s*:|\\[\\s*${headerKeyPattern}\\s*])`,
+    `\\b(?:Object|Reflect)\\s*\\.\\s*defineProperty\\s*\\(\\s*${identifierPattern}\\s*,\\s*${headerKeyPattern}`,
+    `\\bObject\\s*\\.\\s*defineProperties\\s*\\(\\s*${identifierPattern}\\s*,\\s*\\{[^)]*(?:\\bheaders\\s*:|\\[\\s*${headerKeyPattern}\\s*])`,
+    `\\bReflect\\s*\\.\\s*set\\s*\\(\\s*${identifierPattern}\\s*,\\s*${headerKeyPattern}`,
     `\\bObject\\s*\\.\\s*setPrototypeOf\\s*\\(\\s*${identifierPattern}\\b`,
   ].join('|'), 'm')
   return mutation.test(afterObject) ? null : { body, start: openingBrace }
@@ -929,7 +929,7 @@ function requiresNode24OrNewer(range: string): boolean {
 }
 
 function affirmativeOperationalEvidence(source: string, patterns: readonly RegExp[]): boolean {
-  const negative = /\b(?:no|not|never|without|missing|unconfigured|unsupported|unavailable|lack(?:s|ing)?)\b/i
+  const negative = /\b(?:no|not|never|without|missing|unconfigured|unsupported|unavailable|disabled|impossible|lack(?:s|ing)?)\b|\b(?:is|are|was|were|do|does|did|can|could|would|should|has|have|had)n['’]t\b/i
   const lines = source.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !negative.test(line))
   return patterns.every((pattern) => lines.some((line) => pattern.test(line)))
 }
