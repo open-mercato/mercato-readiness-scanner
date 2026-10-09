@@ -247,6 +247,12 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
     overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; Object.assign(config, { headers: undefined }); export default config\n`)
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; Object.defineProperty(config, "headers", { value: undefined }); export default config\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; delete config.headers; export default config\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; config.images = { remotePatterns: [] }; export default config\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'pass')
 
     const validTemplate = fs.readFileSync(path.join(root, '.env.example'), 'utf8')
     overwrite(root, '.env.example', validTemplate.replace('RATE_LIMIT_TRUST_PROXY_DEPTH=1', 'RATE_LIMIT_TRUST_PROXY_DEPTH=unbounded'))
@@ -268,11 +274,19 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     assert.equal(scan(root).get('operations-health-check')?.status, 'fail')
     overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    healthcheck:\n      test: ["CMD", "curl", "--fail", "http://localhost:3000/api/healthz"]\n')
     assert.equal(scan(root).get('operations-health-check')?.status, 'warning')
+    for (const option of ['-F', '--fail-early']) {
+      overwrite(root, 'docker-compose.fullapp.yml', `services:\n  app:\n    healthcheck:\n      test: ["CMD", "curl", "${option}", "http://localhost:3000/api/healthz"]\n`)
+      assert.equal(scan(root).get('operations-health-check')?.status, 'fail', option)
+    }
 
     overwrite(root, 'Dockerfile', 'FROM node:24 AS mutable\nRUN npm install\nFROM node:24 AS decoy\nRUN npm ci\nFROM mutable AS runtime\nUSER app\n')
     assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'fail')
+    overwrite(root, 'Dockerfile', 'FROM node:24 AS unused-development\nRUN npm install\nFROM node:24 AS build\nRUN npm ci\nFROM build AS runtime\nUSER app\n')
+    assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'pass')
 
     overwrite(root, '.github/workflows/release.yml', 'on:\n  push:\n    branches: [main]\njobs:\n  validate:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: main\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n')
+    assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
+    overwrite(root, '.github/workflows/release.yml', 'on:\n  push:\n    branches: [main]\njobs:\n  validate:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: 0123456789abcdef0123456789abcdef01234567\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n')
     assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\n# TODO configure TLS, backup, restore, and rollback\nRUN yarn install --immutable\nUSER app\n')
@@ -280,6 +294,13 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     assert.equal(scan(root).get('edge-tls-and-canonical-origin')?.status, 'fail')
     assert.equal(scan(root).get('data-backup-restore-runbook')?.status, 'fail')
     assert.equal(scan(root).get('release-rollback-runbook')?.status, 'fail')
+    overwrite(root, 'docs/operations.md', 'TLS is not configured.\nThere is no backup or restore runbook.\nWe have no rollback or forward-fix procedure.\n')
+    assert.equal(scan(root).get('edge-tls-and-canonical-origin')?.status, 'fail')
+    assert.equal(scan(root).get('data-backup-restore-runbook')?.status, 'fail')
+    assert.equal(scan(root).get('release-rollback-runbook')?.status, 'fail')
+
+    overwrite(root, 'railway.toml', '[deploy]\nstartCommand = "command /bin/false && yarn db:migrate"\n')
+    assert.equal(scan(root).get('release-database-migrations')?.status, 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
     assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'fail')

@@ -295,7 +295,10 @@ function executableHealthCheck(value: Record<string, unknown>): boolean {
   if (!command || !commandPreservesFailure(command) || hasNonExecutingFlag(command)) return false
   const executable = command.replace(/^(?:sh|bash)\s+(?:-[A-Za-z]*e[A-Za-z]*\s+)?-c\s+/i, '')
   if (/^wget\b[^\r\n;&|]*\/api\/healthz\b/i.test(executable)) return true
-  return /^curl\b(?=[^\r\n;&|]*(?:--fail(?:-with-body)?\b|-[A-Za-z]*f[A-Za-z]*\b))[^\r\n;&|]*\/api\/healthz\b/i.test(executable)
+  if (!/^curl\b/i.test(executable)) return false
+  const hasFailureMode = /(?:^|\s)--fail(?:-with-body)?(?=\s|$)/.test(executable)
+    || /(?:^|\s)-[A-Za-z]*f[A-Za-z]*(?=\s|$)/.test(executable)
+  return hasFailureMode && /\/api\/healthz\b/i.test(executable)
 }
 
 function configuredHealthCheck(context: ScanContext): boolean {
@@ -318,7 +321,7 @@ function executableMigrationCommand(command: string): boolean {
   const segments = normalized.split(/\s*&&\s*|\r?\n/).map((segment) => segment.trim()).filter(Boolean)
   const migrationIndex = segments.findIndex((segment) => /^(?:exec\s+)?(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)(?:\s+[^;&|<\r\n]+)?$/i.test(segment))
   if (migrationIndex < 0) return false
-  return !segments.slice(0, migrationIndex).some((segment) => /^(?:(?:\/[^\s/]+)*\/false\b|false\b|exit\b|return\b|exec\b)/i.test(segment))
+  return segments.slice(0, migrationIndex).every((segment) => /^(?:cd\s+[^;&|<\r\n]+|echo\b[^;&|<\r\n]*|printf\b[^;&|<\r\n]*|set\s+-[A-Za-z]*e[A-Za-z]*|[A-Z_][A-Z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+))$/i.test(segment))
 }
 
 function configuredMigration(context: ScanContext): boolean {
@@ -594,7 +597,7 @@ function workflowJobs(workflow: string, source: string): WorkflowJob[] {
         if (!isRecord(step) || typeof step.uses !== 'string' || !/^actions\/checkout@/i.test(step.uses)) return true
         if (!isRecord(step.with) || step.with.ref === undefined) return true
         if (typeof step.with.ref !== 'string') return false
-        return /^\$\{\{\s*github\.sha\s*\}\}$/i.test(step.with.ref.trim()) || /^[a-f0-9]{40}$/i.test(step.with.ref.trim())
+        return /^\$\{\{\s*github\.sha\s*\}\}$/i.test(step.with.ref.trim())
       })
       if (!checkoutIsExact) continue
       const jobDefaults = isRecord(value.defaults) && isRecord(value.defaults.run) ? value.defaults.run : workflowDefaults
@@ -677,21 +680,59 @@ function dependencyInstallationProof(context: ScanContext): { found: boolean, mu
   for (const file of DEPLOYMENT_FILES) {
     const source = uncommented(context.readText(file) ?? '').replace(/\\\r?\n/g, ' ')
     if (!source.trim()) continue
-    const commands = source.split(/\r?\n|&&|\|\||;|&|\|/)
-    const mutations = commands.map(dependencyMutation).filter((value): value is DependencyMutation => value !== null)
+    if (file === 'Dockerfile') {
+      const state = effectiveDockerDependencyState(source)
+      if (state === null) continue
+      found = true
+      if (state !== 'immutable') mutableSurfaces.push(file)
+      continue
+    }
+    const mutations = source.split(/\r?\n|&&|\|\||;|&|\|/)
+      .map(dependencyMutation).filter((value): value is DependencyMutation => value !== null)
     if (!mutations.length) continue
     found = true
-    if (file === 'Dockerfile') {
-      const stages = source.split(/^\s*FROM\s+/gmi).slice(1)
-      const unsafeStage = stages.some((stage) => {
-        const stageMutations = stage.split(/\r?\n|&&|\|\||;|&|\|/)
-          .map(dependencyMutation).filter((value): value is DependencyMutation => value !== null)
-        return stageMutations.length > 0 && stageMutations.at(-1) !== 'immutable'
-      })
-      if (unsafeStage) mutableSurfaces.push(file)
-    } else if (mutations.at(-1) !== 'immutable') mutableSurfaces.push(file)
+    if (mutations.at(-1) !== 'immutable') mutableSurfaces.push(file)
   }
   return { found, mutableSurfaces }
+}
+
+type DockerDependencyStage = { name: string, parents: string[], mutations: DependencyMutation[] }
+
+function effectiveDockerDependencyState(source: string): DependencyMutation | null {
+  const stages: DockerDependencyStage[] = []
+  let current: DockerDependencyStage | null = null
+  for (const line of source.split(/\r?\n/)) {
+    const from = line.match(/^\s*FROM\s+(?:--platform=\S+\s+)?([^\s]+)(?:\s+AS\s+([^\s#]+))?/i)
+    if (from?.[1]) {
+      current = { name: (from[2] ?? String(stages.length)).toLowerCase(), parents: [from[1].toLowerCase()], mutations: [] }
+      stages.push(current)
+      continue
+    }
+    if (!current) continue
+    const copied = line.match(/^\s*COPY\s+--from=([^\s]+)\b/i)?.[1]?.toLowerCase()
+    if (copied) current.parents.push(copied)
+    for (const command of line.split(/&&|\|\||;|&|\|/)) {
+      const mutation = dependencyMutation(command)
+      if (mutation) current.mutations.push(mutation)
+    }
+  }
+  const finalStage = stages.at(-1)
+  if (!finalStage) return null
+  const byName = new Map(stages.map((stage) => [stage.name, stage]))
+  const resolve = (stage: DockerDependencyStage, visiting = new Set<string>()): DependencyMutation | null => {
+    if (visiting.has(stage.name)) return 'mutable'
+    const nextVisiting = new Set(visiting)
+    nextVisiting.add(stage.name)
+    const inherited = stage.parents.flatMap((parent) => {
+      const dependency = byName.get(parent)
+      return dependency ? [resolve(dependency, nextVisiting)] : []
+    }).filter((value): value is DependencyMutation => value !== null)
+    const own = stage.mutations.at(-1)
+    if (own) return own
+    if (inherited.includes('mutable')) return 'mutable'
+    return inherited.includes('immutable') ? 'immutable' : null
+  }
+  return resolve(finalStage)
 }
 
 function extractDelimitedBody(source: string, openingIndex: number, opening: string, closing: string): string | null {
@@ -798,7 +839,15 @@ function exportedConfigObject(source: string): { body: string, start: number } |
   const body = extractDelimitedBody(source, openingBrace, '{', '}')
   if (body === null) return null
   const afterObject = source.slice(openingBrace + body.length + 2)
-  const mutation = new RegExp(`(?:\\b${escapedIdentifier(identifier)}\\s*(?:\\[[^\\]]*]|\\.[A-Za-z_$][\\w$]*)\\s*=|\\b(?:Object\\s*\\.\\s*assign|Reflect\\s*\\.\\s*set)\\s*\\(\\s*${escapedIdentifier(identifier)}\\b)`, 'm')
+  const identifierPattern = escapedIdentifier(identifier)
+  const mutation = new RegExp([
+    `\\b${identifierPattern}\\s*(?:\\.\\s*headers|\\[\\s*(?:["']headers["']|[A-Za-z_$][\\w$]*)\\s*])\\s*=`,
+    `\\bdelete\\s+${identifierPattern}\\s*(?:\\.\\s*headers|\\[[^\\]]+])`,
+    `\\bObject\\s*\\.\\s*assign\\s*\\(\\s*${identifierPattern}\\s*,\\s*\\{[^)]*(?:\\bheaders\\s*:|\\[)`,
+    `\\bObject\\s*\\.\\s*definePropert(?:y|ies)\\s*\\(\\s*${identifierPattern}\\s*,\\s*(?:["']headers["']|[A-Za-z_$][\\w$]*|\\{[^)]*\\bheaders\\s*:)`,
+    `\\bReflect\\s*\\.\\s*set\\s*\\(\\s*${identifierPattern}\\s*,\\s*(?:["']headers["']|[A-Za-z_$][\\w$]*)`,
+    `\\bObject\\s*\\.\\s*setPrototypeOf\\s*\\(\\s*${identifierPattern}\\b`,
+  ].join('|'), 'm')
   return mutation.test(afterObject) ? null : { body, start: openingBrace }
 }
 
@@ -879,6 +928,12 @@ function requiresNode24OrNewer(range: string): boolean {
   return minimum !== null && minimum.major >= 24
 }
 
+function affirmativeOperationalEvidence(source: string, patterns: readonly RegExp[]): boolean {
+  const negative = /\b(?:no|not|never|without|missing|unconfigured|unsupported|unavailable|lack(?:s|ing)?)\b/i
+  const lines = source.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !negative.test(line))
+  return patterns.every((pattern) => lines.some((line) => pattern.test(line)))
+}
+
 export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'secrets-live-env-untracked', title: 'Live environment files are not tracked', category: 'Secrets', severity: 'critical',
@@ -949,7 +1004,7 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Serve every public route over HTTPS, redirect HTTP, verify certificate renewal, and set the canonical public origin to the real HTTPS URL.',
     check: (context) => {
       const source = context.collectOperationalDocs()
-      const hasTlsRunbook = /\b(?:https|tls|certificate)\b/i.test(source)
+      const hasTlsRunbook = affirmativeOperationalEvidence(source, [/\b(?:https|tls|certificate)\b/i])
       return hasTlsRunbook
         ? { status: 'warning', summary: 'TLS guidance exists, but a static scan cannot verify the live certificate, redirect, DNS, or canonical origin.' }
         : { status: 'fail', summary: 'No deployment guidance records TLS and canonical-origin verification.' }
@@ -1172,7 +1227,7 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Document database and file backups, retention, encryption, off-site copies, restore ownership, and a dated restore rehearsal.',
     check: (context) => {
       const source = context.collectOperationalDocs()
-      return containsAll(source.toLowerCase(), ['backup', 'restore'])
+      return affirmativeOperationalEvidence(source, [/\bback(?:up| up)\b/i, /\brestore\b/i])
         ? { status: 'warning', summary: 'Backup and restore guidance exists; verify current off-site copies and a successful dated restore rehearsal.' }
         : { status: 'fail', summary: 'No backup-and-restore runbook was found.' }
     },
@@ -1180,7 +1235,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'release-rollback-runbook', title: 'Rollback and forward-fix procedures are documented', category: 'Release', severity: 'high',
     remediation: 'Document immutable artifact rollback, database compatibility constraints, forward-fix ownership, and rollback verification.',
-    check: (context) => /\brollback\b|\bforward[- ]fix\b/i.test(context.collectOperationalDocs())
+    check: (context) => affirmativeOperationalEvidence(context.collectOperationalDocs(), [/\b(?:rollback|forward[- ]fix)\b/i])
       ? { status: 'warning', summary: 'Rollback guidance exists; rehearse it against the actual provider and database change policy.' }
       : { status: 'fail', summary: 'No rollback or forward-fix runbook was found.' },
   }),
