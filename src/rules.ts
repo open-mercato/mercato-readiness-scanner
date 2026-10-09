@@ -140,14 +140,73 @@ function displayPath(value: string): string {
   return value.replace(/[\u0000-\u001F\u007F]/g, '?').slice(0, 240)
 }
 
-function ignorePatterns(context: ScanContext): ReadonlySet<string> {
+function missingSensitiveIgnoreCoverage(context: ScanContext): string[] {
   const source = context.readText('.gitignore') ?? ''
-  return new Set(source.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#')))
+  if (!source.trim()) return ['all sensitive local artifacts']
+  const probes = [
+    ['.env', '.env'],
+    ['.env.production', '.env.production'],
+    ['.env.local', '.env.local'],
+    ['.env.*.local', '.env.preview.local'],
+    ['*.pem', 'operator.pem'],
+    ['*.key', 'operator.key'],
+    ['.mcp.json', '.mcp.json'],
+    ['.npmrc', '.npmrc'],
+    ['.ai/session-exports/', '.ai/session-exports/session.json'],
+  ] as const
+  return probes.filter(([, path]) => !gitignoreMatches(source, path)).map(([pattern]) => pattern)
 }
 
-function missingIgnorePatterns(context: ScanContext): string[] {
-  const patterns = ignorePatterns(context)
-  return REQUIRED_IGNORE_PATTERNS.filter((pattern) => !patterns.has(pattern))
+function gitignoreMatches(source: string, target: string): boolean {
+  let ignored = false
+  for (const rawLine of source.split(/\r?\n/)) {
+    const trimmed = rawLine.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const negated = trimmed.startsWith('!')
+    let pattern = negated ? trimmed.slice(1) : trimmed
+    if (!pattern) continue
+    const directory = pattern.endsWith('/')
+    pattern = pattern.replace(/^\//, '').replace(/\/$/, '')
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replaceAll('**', '\u0000')
+      .replaceAll('*', '[^/]*')
+      .replaceAll('\u0000', '.*')
+      .replaceAll('?', '[^/]')
+    const anchored = pattern.includes('/')
+    const expression = directory
+      ? new RegExp(anchored ? `^${escaped}(?:/.*)?$` : `(?:^|/)${escaped}(?:/.*)?$`)
+      : new RegExp(anchored ? `^${escaped}$` : `(?:^|/)${escaped}$`)
+    if (expression.test(target)) ignored = !negated
+  }
+  return ignored
+}
+
+function unsafeTemplateValues(context: ScanContext): string[] {
+  const source = context.readText('.env.example') ?? ''
+  let values: Record<string, string | undefined>
+  try {
+    values = parseEnv(source)
+  } catch {
+    return ['unparseable template']
+  }
+  const sensitiveName = /(?:^|_)(?:DATABASE_URL|REDIS_URL|PASSWORD|PASS|TOKEN|SECRET|PRIVATE_KEY|API_KEY|CREDENTIALS?)(?:$|_)/i
+  const placeholder = /^(?:|changeme|replace[-_ ]?me|dummy|placeholder|example|<[^>]+>|\$\{[^}]+\})$/i
+  const safeHost = (host: string): boolean => host === 'localhost' || host === '127.0.0.1' || host === '::1'
+    || host === 'example.com' || host.endsWith('.example') || host.endsWith('.test')
+  const unsafe: string[] = []
+  for (const [key, raw] of Object.entries(values)) {
+    if (!sensitiveName.test(key) || raw === undefined) continue
+    const value = raw.trim()
+    if (placeholder.test(value)) continue
+    try {
+      const url = new URL(value)
+      const safeCredentials = (!url.username && !url.password)
+        || (placeholder.test(decodeURIComponent(url.username)) && placeholder.test(decodeURIComponent(url.password)))
+      if (safeHost(url.hostname) && safeCredentials) continue
+    } catch {}
+    unsafe.push(key)
+  }
+  return unsafe
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -277,7 +336,10 @@ function executableDeploymentText(context: ScanContext): string {
 }
 
 function isWorkerCommand(value: string): boolean {
-  return /(?:^|[;&]\s*)(?:exec\s+)?(?:(?:yarn|pnpm)(?:\s+run)?\s+(?:mercato\s+)?worker|npm\s+run\s+(?:mercato\s+)?worker|mercato\s+worker)(?:\s|$)/im.test(value)
+  const normalized = value.trim()
+  return commandPreservesFailure(normalized)
+    && !hasNonExecutingFlag(normalized)
+    && /^(?:exec\s+)?(?:(?:yarn|pnpm)(?:\s+run)?\s+(?:mercato\s+)?worker|npm\s+run\s+(?:mercato\s+)?worker|mercato\s+worker)$/i.test(normalized)
 }
 
 function composeServices(context: ScanContext, file: string): Array<[string, Record<string, unknown>]> | null {
@@ -468,10 +530,18 @@ function shellPreservesFailure(value: unknown): boolean {
 }
 
 function releaseTrigger(value: unknown): boolean {
-  const accepted = new Set(['push', 'release', 'workflow_dispatch', 'workflow_call'])
-  if (typeof value === 'string') return accepted.has(value)
-  if (Array.isArray(value)) return value.some((entry) => typeof entry === 'string' && accepted.has(entry))
-  return isRecord(value) && Object.keys(value).some((key) => accepted.has(key))
+  if (typeof value === 'string') return value === 'push' || value === 'release'
+  if (Array.isArray(value)) return value.some((entry) => entry === 'push' || entry === 'release')
+  if (!isRecord(value)) return false
+  if (Object.hasOwn(value, 'release')) return true
+  if (!Object.hasOwn(value, 'push')) return false
+  const push = value.push
+  if (!isRecord(push)) return true
+  const configured = push.branches ?? push.tags
+  if (configured === undefined) return true
+  const filters = Array.isArray(configured) ? configured : [configured]
+  return filters.some((entry) => typeof entry === 'string'
+    && (/^(?:main|master|develop)$/.test(entry) || /[*?]/.test(entry) || entry.includes('[')))
 }
 
 function workflowJobs(workflow: string, source: string): WorkflowJob[] {
@@ -502,16 +572,27 @@ function workflowJobs(workflow: string, source: string): WorkflowJob[] {
 }
 
 function hasBlockingPackageCommand(commands: WorkflowCommand[], name: string): boolean {
-  const pattern = new RegExp(`(?:^|[;&|]\\s*)(?:corepack\\s+)?(?:yarn(?:\\s+run)?|pnpm(?:\\s+run)?|npm(?:\\s+run)?)\\s+${name}\\b`, 'im')
-  return commands.some(({ command, blocking }) => blocking && commandPreservesFailure(command) && pattern.test(command))
+  const pattern = new RegExp(`^(?:corepack\\s+)?(?:yarn(?:\\s+run)?|pnpm(?:\\s+run)?|npm(?:\\s+run)?)\\s+${name}(?:[ \\t]+[^;&|<\\r\\n]+)?$`, 'i')
+  return commands.some(({ command, blocking }) => {
+    const normalized = command.trim()
+    return blocking && commandPreservesFailure(normalized) && !hasNonExecutingFlag(normalized) && pattern.test(normalized)
+  })
 }
 
 function hasBlockingMigrationCommand(commands: WorkflowCommand[]): boolean {
-  return commands.some(({ command, blocking }) => blocking && commandPreservesFailure(command) && /(?:^|[;&|]\s*)(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)\b/im.test(command))
+  return commands.some(({ command, blocking }) => {
+    const normalized = command.trim()
+    return blocking && commandPreservesFailure(normalized) && !hasNonExecutingFlag(normalized)
+      && /^(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)(?:[ \t]+[^;&|<\r\n]+)?$/i.test(normalized)
+  })
 }
 
 function commandPreservesFailure(command: string): boolean {
   return !/\||(?:^|[^&])&(?!&)|\bset\s+\+e\b|(?:;|\n)\s*(?:exit\s+0|true|:)(?:\s|$)/i.test(command)
+}
+
+function hasNonExecutingFlag(command: string): boolean {
+  return /(?:^|\s)(?:--help|--version|-h|-v)(?:\s|$)/i.test(command)
 }
 
 type DependencyMutation = 'immutable' | 'mutable'
@@ -635,11 +716,13 @@ function escapedIdentifier(identifier: string): string {
 
 function declaredArray(scope: string, identifier: string): string | null {
   const projection = topLevelProjection(scope)
-  const pattern = new RegExp(`(?:const|let|var)\\s+${escapedIdentifier(identifier)}\\s*=\\s*\\[`, 'gm')
-  let selected: RegExpExecArray | null = null
-  for (const match of projection.matchAll(pattern)) selected = match
+  const pattern = new RegExp(`(?:(?:const|let|var)\\s+|(?:^|[;\\n])\\s*)${escapedIdentifier(identifier)}\\s*=\\s*`, 'gm')
+  const assignments = [...projection.matchAll(pattern)]
+  const selected = assignments.at(-1)
   if (!selected) return null
-  const openingBracket = projection.indexOf('[', selected.index)
+  const valueStart = (selected.index ?? 0) + selected[0].length
+  const openingBracket = projection.indexOf('[', valueStart)
+  if (openingBracket !== valueStart || projection.slice(valueStart, openingBracket).trim()) return null
   return extractDelimitedBody(scope, openingBracket, '[', ']')
 }
 
@@ -658,10 +741,13 @@ function exportedConfigObject(source: string): { body: string, start: number } |
   const identifier = remainder.match(/^([A-Za-z_$][\w$]*)\b/)?.[1]
   if (!identifier) return null
   const beforeExport = projection.slice(0, exported.index)
-  const declarations = [...beforeExport.matchAll(new RegExp(`(?:const|let|var)\\s+${escapedIdentifier(identifier)}\\s*=\\s*\\{`, 'gm'))]
-  const declaration = declarations.at(-1)
-  if (!declaration) return null
-  const openingBrace = projection.indexOf('{', declaration.index)
+  if (new RegExp(`${escapedIdentifier(identifier)}\\s*\\.\\s*headers\\s*=`, 'm').test(beforeExport)) return null
+  const assignments = [...beforeExport.matchAll(new RegExp(`(?:(?:const|let|var)\\s+|(?:^|[;\\n])\\s*)${escapedIdentifier(identifier)}\\s*=\\s*`, 'gm'))]
+  const assignment = assignments.at(-1)
+  if (!assignment) return null
+  const valueOffset = (assignment.index ?? 0) + assignment[0].length
+  const openingBrace = projection.indexOf('{', valueOffset)
+  if (openingBrace !== valueOffset || projection.slice(valueOffset, openingBrace).trim()) return null
   const body = extractDelimitedBody(source, openingBrace, '{', '}')
   return body === null ? null : { body, start: openingBrace }
 }
@@ -672,13 +758,12 @@ function activeHeadersBody(configBody: string): string | null {
     /(?:^|[,;])\s*(?:async\s+)?headers\s*\([^)]*\)\s*\{/gm,
     /(?:^|[,;])\s*headers\s*:\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*(?:=>\s*)?\{/gm,
   ]
-  for (const pattern of patterns) {
-    const match = pattern.exec(projection)
-    if (!match) continue
-    const openingBrace = projection.indexOf('{', match.index)
-    return extractDelimitedBody(configBody, openingBrace, '{', '}')
-  }
-  return null
+  const matches = patterns.flatMap((pattern) => [...projection.matchAll(pattern)])
+    .sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
+  const effective = matches.at(-1)
+  if (!effective) return null
+  const openingBrace = projection.indexOf('{', effective.index)
+  return extractDelimitedBody(configBody, openingBrace, '{', '}')
 }
 
 function topLevelObjectBodies(source: string): string[] {
@@ -707,7 +792,7 @@ function activeHeaderEntries(source: string): Map<string, string> {
   const headerArrays: string[] = []
   for (const route of topLevelObjectBodies(returnedEntries)) {
     const routeProjection = topLevelProjection(route)
-    const match = /\bheaders\s*:\s*/m.exec(routeProjection)
+    const match = [...routeProjection.matchAll(/\bheaders\s*:\s*/gm)].at(-1)
     if (!match) continue
     const valueStart = match.index + match[0].length
     const remainder = route.slice(valueStart).trimStart()
@@ -724,8 +809,8 @@ function activeHeaderEntries(source: string): Map<string, string> {
     if (global) headerArrays.push(global)
   }
   for (const object of headerArrays.join('\n').match(/\{[^{}]*\}/g) ?? []) {
-    const key = object.match(/\bkey\s*:\s*["']([^"']+)["']/)?.[1]
-    if (key && /\bvalue\s*:/.test(object)) entries.set(key, object)
+    const key = [...object.matchAll(/\bkey\s*:\s*["']([^"']+)["']/g)].at(-1)?.[1]
+    if (key && [...object.matchAll(/\bvalue\s*:/g)].length > 0) entries.set(key, object)
   }
   return entries
 }
@@ -769,21 +854,25 @@ export const RULES: readonly RuleDefinition[] = [
       safety: 'safe-additive',
       summary: 'Append the missing ignore patterns to .gitignore, or create .gitignore when it is absent.',
       plan: (context) => {
-        const missing = missingIgnorePatterns(context)
-        if (!missing.length) return []
-        if (!context.exists('.gitignore')) {
-          return [{ kind: 'create-file', path: '.gitignore', contents: `${[...IGNORE_FILE_HEADER, ...missing].join('\n')}\n`, description: `create .gitignore with ${missing.length} sensitive-artifact pattern(s)` }]
+        const required: readonly string[] = REQUIRED_IGNORE_PATTERNS
+        const source = context.readText('.gitignore')
+        if (source === null) {
+          return [{ kind: 'create-file', path: '.gitignore', contents: `${[...IGNORE_FILE_HEADER, ...required].join('\n')}\n`, description: `create .gitignore with ${required.length} sensitive-artifact pattern(s)` }]
         }
-        return [{ kind: 'append-lines', path: '.gitignore', lines: missing, description: `append ${missing.length} missing ignore pattern(s): ${missing.join(', ')}` }]
+        // Mirror the check's effective-coverage view, not raw pattern presence: a pattern that is
+        // listed but re-included by a later negation still needs appending, and appending wins
+        // because the last matching .gitignore pattern decides. A present-but-blank file reports
+        // the "all artifacts" sentinel, which is not itself an appendable pattern.
+        const missing = source.trim() ? missingSensitiveIgnoreCoverage(context).filter((pattern) => required.includes(pattern)) : [...required]
+        if (!missing.length) return []
+        return [{ kind: 'append-lines', path: '.gitignore', lines: missing, force: true, description: `append ${missing.length} missing ignore pattern(s): ${missing.join(', ')}` }]
       },
     },
     check: (context) => {
-      const patterns = ignorePatterns(context)
-      if (!patterns.size) return { status: 'fail', summary: 'No readable .gitignore defines a sensitive-file policy.' }
-      const missing = missingIgnorePatterns(context)
+      const missing = missingSensitiveIgnoreCoverage(context)
       return missing.length === 0
-        ? { status: 'pass', summary: 'The ignore policy covers common Open Mercato secret and session artifacts.' }
-        : { status: 'fail', summary: 'The ignore policy misses sensitive local artifacts.', evidence: missing.map((pattern) => `Missing ignore coverage: ${pattern}`) }
+        ? { status: 'pass', summary: 'The effective ignore policy covers common Open Mercato secret and session artifacts.' }
+        : { status: 'fail', summary: 'The effective ignore policy misses or re-includes sensitive local artifacts.', evidence: missing.map((pattern) => `Missing effective ignore coverage: ${pattern}`) }
     },
   }),
   rule({
@@ -794,6 +883,8 @@ export const RULES: readonly RuleDefinition[] = [
       if (!context.exists('.env.example')) return { status: 'fail', summary: 'The application has no .env.example template.' }
       const inventory = templateInventory(context)
       const missing = ['NODE_ENV', 'APP_URL', 'DATABASE_URL', 'INTERNAL_APP_ORIGIN', 'PLATFORM_PRIMARY_HOST'].filter((key) => !inventory.names.has(key))
+      const unsafe = unsafeTemplateValues(context)
+      if (unsafe.length) return { status: 'fail', summary: 'The environment template contains non-placeholder values in secret-bearing settings.', evidence: unsafe.map((key) => `Unsafe template value: ${key}`) }
       return missing.length === 0
         ? { status: 'pass', summary: 'The sanitized environment template names the core production settings.' }
         : { status: 'fail', summary: 'The environment template omits core production settings.', evidence: missing.map((key) => `Missing template key: ${key}`) }
@@ -820,10 +911,10 @@ export const RULES: readonly RuleDefinition[] = [
       const build = values.build ?? ''
       const start = values.start ?? ''
       const productionBuild = /^\s*(?:cross-env(?:-shell)?\s+)?NODE_ENV=production\s+(?:next|mercato)\s+build(?:[ \t]+[^;&|\r\n]+)?\s*$/i.test(build)
-        && commandPreservesFailure(build)
+        && commandPreservesFailure(build) && !hasNonExecutingFlag(build)
       if (!productionBuild) return { status: 'fail', summary: 'The build script does not run a failure-preserving production build with NODE_ENV=production.' }
       const productionStart = /^\s*(?:cross-env(?:-shell)?\s+)?(?:(?:[A-Za-z_][A-Za-z0-9_]*)=(?:"[^"]*"|'[^']*'|[^\s]+)[ \t]+)*(?:next[ \t]+start|mercato[ \t]+(?:server[ \t]+)?start|node[ \t]+(?:\.next\/standalone\/)?server(?:\.js)?)(?:[ \t]+[^;&|\r\n]+)?\s*$/i.test(start)
-        && commandPreservesFailure(start)
+        && commandPreservesFailure(start) && !hasNonExecutingFlag(start)
       if (!productionStart) return { status: 'fail', summary: 'The start script does not launch a failure-preserving production server.' }
       return { status: 'pass', summary: 'Production build and start scripts are present and production mode is explicit.' }
     },

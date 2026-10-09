@@ -63,7 +63,7 @@ function previewAction(id: string, action: AutofixAction): AppliedChange {
 function performAction(root: string, id: string, action: AutofixAction): AppliedChange {
   const base = { id, description: action.description, path: actionPath(action) }
   if (action.kind === 'create-file') return { ...base, ...createFile(root, action.path, action.contents) }
-  if (action.kind === 'append-lines') return { ...base, ...appendLines(root, action.path, action.lines) }
+  if (action.kind === 'append-lines') return { ...base, ...appendLines(root, action.path, action.lines, action.force ?? false) }
   return { ...base, ...addNpmScript(root, action.name, action.value) }
 }
 
@@ -110,7 +110,7 @@ function createFile(root: string, relativePath: string, contents: string): Write
   return { changed: true, note: null }
 }
 
-function appendLines(root: string, relativePath: string, lines: string[]): WriteResult {
+function appendLines(root: string, relativePath: string, lines: string[], force = false): WriteResult {
   const absolute = resolveWritable(root, relativePath)
   let stat: fs.Stats
   try {
@@ -121,7 +121,9 @@ function appendLines(root: string, relativePath: string, lines: string[]): Write
   if (!stat.isFile()) throw new ApplyRefusedError(`Refusing to append to ${relativePath}: it is not a regular file.`)
   const existing = fs.readFileSync(absolute, 'utf8')
   const present = new Set(existing.split(/\r?\n/).map((line) => line.trim()))
-  const absent = lines.filter((line) => !present.has(line.trim()))
+  // A forced append trusts the planner: it already decided from the file's *effective* state that
+  // the line is needed, which a verbatim-presence check cannot see.
+  const absent = force ? lines : lines.filter((line) => !present.has(line.trim()))
   if (!absent.length) return { changed: false, note: 'every line already present; left untouched' }
   const separator = existing.length === 0 || existing.endsWith('\n') ? '' : '\n'
   // 'a' only ever adds bytes at the end of the file; existing content is never rewritten.

@@ -51,8 +51,15 @@ export type AutofixSafety = 'safe-additive' | 'manual-only'
 export type AutofixAction =
   /** Create `path` with `contents`; refused when anything already exists at that path. */
   | { kind: 'create-file', path: string, contents: string, description: string }
-  /** Append `lines` that are absent from the existing line set; never rewrites a line. */
-  | { kind: 'append-lines', path: string, lines: string[], description: string }
+  /**
+   * Append `lines` that are absent from the existing line set; never rewrites a line.
+   *
+   * Set `force` when the planner has already decided the line is needed even though it appears
+   * verbatim earlier in the file — in a last-match-wins format such as `.gitignore`, re-appending
+   * a listed-but-overridden pattern is the fix. Idempotence then rests on the planner emitting no
+   * action once the file's effective state is correct.
+   */
+  | { kind: 'append-lines', path: string, lines: string[], description: string, force?: boolean }
   /** Insert a missing `package.json` script key; never changes an existing value. */
   | { kind: 'add-npm-script', name: string, value: string, description: string }
 

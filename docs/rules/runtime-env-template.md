@@ -10,8 +10,9 @@ without exposing live values. The scanner expects the core production settings
 
 ## Remediation
 
-Create or update `.env.example` with names, safe placeholders, and useful
-comments only. Compare it with the exact deployed release. Do not copy live
-credentials or environment-specific secrets into the template.
+Create or update `.env.example` with names, empty values or unmistakably safe
+placeholders, and useful comments only. Compare it with the exact deployed
+release. Do not copy credential-bearing URLs, live credentials, or
+environment-specific secrets into the template.
 
 See [Prepare the production environment and secrets](https://docs.openmercato.com/deployment/production-readiness#ordered-production-checklist).

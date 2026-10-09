@@ -166,6 +166,36 @@ test('never rewrites an existing script value', () => {
   }
 })
 
+test('restores ignore coverage that a later negation re-includes', () => {
+  // The check tests *effective* gitignore coverage, so a pattern that is listed and then
+  // re-included by a later negation is still a finding. The autofix has to see the same thing:
+  // filtering on raw pattern presence would report nothing to fix while the rule kept failing.
+  const files = { ...brokenFiles(), '.gitignore': '.env\n.env.local\n!.env\n' }
+  const root = makeAppFixture({ files, git: 'commit' })
+  try {
+    assert.equal(statuses(root).get('secrets-ignore-policy'), 'fail')
+
+    const result = run(['apply', root, '--yes', '--no-color'])
+    assert.equal(result.status, 0, result.stderr)
+
+    // Appended, never rewritten: the operator's own three lines survive byte-for-byte at the top.
+    const ignore = read(root, '.gitignore')
+    assert.ok(ignore.startsWith('.env\n.env.local\n!.env\n'), ignore)
+    // And the re-appended pattern lands after the negation, so last-match-wins makes it effective.
+    const lines = ignore.split('\n')
+    assert.ok(lines.lastIndexOf('.env') > lines.indexOf('!.env'), ignore)
+    assert.equal(statuses(root).get('secrets-ignore-policy'), 'pass')
+
+    // And it converges: a second pass has nothing left to do.
+    commitFixture(root, 'restore ignore coverage')
+    const again = run(['apply', root, '--yes', '--no-color'])
+    assert.equal(again.status, 0, again.stderr)
+    assert.match(again.stdout, /0 change\(s\) written/)
+  } finally {
+    removeFixture(root)
+  }
+})
+
 test('a second apply is a no-op', () => {
   const root = makeAppFixture({ files: brokenFiles(), git: 'commit' })
   try {

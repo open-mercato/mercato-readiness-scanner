@@ -13,7 +13,9 @@ rotation.
 Add narrowly scoped patterns for `.env`, `.env.production`, `.env.local`,
 `.env.*.local`, `*.pem`, `*.key`, `.mcp.json`, `.npmrc`, and
 `.ai/session-exports/`. Keep explicit exceptions only for sanitized templates.
-Verify the policy with `git check-ignore` before handling production values.
+The scanner evaluates ordered negations, so a later re-inclusion of one of these
+paths fails the rule. Verify the policy with `git check-ignore` before handling
+production values.
 
 ## Automatic fix
 

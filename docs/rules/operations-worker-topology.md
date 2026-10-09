@@ -10,7 +10,8 @@ compete for the same operational role.
 ## Remediation
 
 Deploy the supported worker command separately with the same release and
-compatible configuration as the web process. Disable conflicting auto-spawn,
-exercise a test job, and alert on worker absence, retries, and queue growth.
+compatible configuration as the web process. Do not mask its exit status or use
+non-executing help/version modes. Disable conflicting auto-spawn, exercise a test
+job, and alert on worker absence, retries, and queue growth.
 
 See [Queue & Workers](https://docs.openmercato.com/framework/events/queue-workers).
