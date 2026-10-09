@@ -1,4 +1,5 @@
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 
@@ -89,6 +90,37 @@ export function gitTrackedFiles(root: string): ReadonlySet<string> | null {
   })
   if (result.error || result.status !== 0) return null
   return new Set(result.stdout.split('\0').filter(Boolean).map(normalized))
+}
+
+export function gitignoredPaths(source: string, paths: readonly string[]): ReadonlySet<string> | null {
+  const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'mercato-readiness-ignore-'))
+  const environment = {
+    ...process.env,
+    GIT_OPTIONAL_LOCKS: '0',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_NOSYSTEM: '1',
+  }
+  try {
+    fs.writeFileSync(path.join(temporary, '.gitignore'), source, { mode: 0o600 })
+    const initialized = spawnSync('git', ['init', '--quiet'], {
+      cwd: temporary, env: environment, encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'ignore', 'ignore'],
+    })
+    if (initialized.error || initialized.status !== 0) return null
+    const ignored = new Set<string>()
+    for (const candidate of paths) {
+      const result = spawnSync('git', [
+        '-c', 'core.fsmonitor=false',
+        '-c', 'core.hooksPath=/dev/null',
+        '-c', 'core.excludesFile=/dev/null',
+        'check-ignore', '--no-index', '--quiet', '--', candidate,
+      ], { cwd: temporary, env: environment, encoding: 'utf8', timeout: 5_000, stdio: ['ignore', 'ignore', 'ignore'] })
+      if (result.error || (result.status !== 0 && result.status !== 1)) return null
+      if (result.status === 0) ignored.add(candidate)
+    }
+    return ignored
+  } finally {
+    fs.rmSync(temporary, { recursive: true, force: true })
+  }
 }
 
 function collectTextFiles(root: string, relativeRoot: string, allowed: RegExp): string[] {
