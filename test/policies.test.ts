@@ -116,6 +116,21 @@ test('counts only active blocking workflow commands as release validation', () =
     ].join('\n'))
     assert.equal(status(root, 'release-validation-gate'), 'fail')
 
+    for (const testCommand of ['yarn test; true', 'yarn test\n          true', 'yarn test | tee test.log']) {
+      overwrite(root, '.github/workflows/release.yml', [
+        'jobs:',
+        '  validate:',
+        '    steps:',
+        '      - run: yarn generate',
+        '      - run: yarn build',
+        '      - shell: bash {0}',
+        '        run: |',
+        `          ${testCommand}`,
+        '      - run: yarn db:migrate --check',
+      ].join('\n'))
+      assert.equal(status(root, 'release-validation-gate'), 'fail', testCommand)
+    }
+
     overwrite(root, '.github/workflows/release.yml', [
       'jobs:',
       '  validate:',
@@ -239,6 +254,26 @@ test('requires effective worker and command evidence instead of comments or empt
     assert.equal(status(root, 'edge-security-headers'), 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN echo preparing # npm ci\nRUN npm install\nUSER app\n')
+    assert.equal(status(root, 'supply-chain-immutable-install'), 'fail')
+
+    overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "echo worker"\n')
+    assert.equal(status(root, 'operations-worker-topology'), 'fail')
+
+    overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "yarn mercato worker"\n')
+    overwrite(root, 'docker-compose.fullapp.yml', [
+      'services:',
+      '  app:',
+      '    image: app:abcdef1',
+      '  worker:',
+      '    image: worker:fedcba9',
+      '    command: yarn mercato worker',
+    ].join('\n'))
+    assert.equal(status(root, 'workers-release-parity'), 'fail')
+
+    overwrite(root, 'next.config.ts', 'const unused = "Content-Security-Policy Referrer-Policy X-Content-Type-Options X-Frame-Options"\nexport default {}\n')
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+
+    overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
     assert.equal(status(root, 'supply-chain-immutable-install'), 'fail')
   } finally {
     removeFixture(root)

@@ -208,12 +208,19 @@ function executableDeploymentText(context: ScanContext): string {
     .join('\n')
 }
 
+function isWorkerCommand(value: string): boolean {
+  return /(?:^|[;&]\s*)(?:exec\s+)?(?:(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:mercato\s+)?worker|mercato\s+worker)(?:\s|$)/im.test(value)
+}
+
 function workerDefinitions(context: ScanContext): string[] {
   const paths: string[] = []
   const railway = context.readText('railway.worker.toml')
-  if (railway && /(?:startCommand\s*=|command\s*=)[^\n]*\bworker\b/i.test(uncommented(railway))) paths.push('railway.worker.toml')
+  if (railway) {
+    const command = uncommented(railway).match(/(?:startCommand|command)\s*=\s*["']([^"']+)["']/i)?.[1]
+    if (command && isWorkerCommand(command)) paths.push('railway.worker.toml')
+  }
   const script = context.readText('scripts/railway-worker.sh')
-  if (script && /\bworker\b/i.test(uncommented(script))) paths.push('scripts/railway-worker.sh')
+  if (script && isWorkerCommand(uncommented(script))) paths.push('scripts/railway-worker.sh')
   const compose = context.readText('docker-compose.fullapp.yml')
   if (compose) {
     try {
@@ -222,7 +229,7 @@ function workerDefinitions(context: ScanContext): string[] {
         const worker = Object.entries(root.services).some(([name, value]) => {
           if (!isRecord(value)) return false
           const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
-          return /worker/i.test(`${name}\n${command}`)
+          return isWorkerCommand(command)
         })
         if (worker) paths.push('docker-compose.fullapp.yml')
       }
@@ -233,16 +240,70 @@ function workerDefinitions(context: ScanContext): string[] {
   return paths
 }
 
-function workerDockerfiles(context: ScanContext): string[] {
-  if (!workerDefinitions(context).includes('railway.worker.toml')) return []
-  const values: string[] = []
-  for (const file of ['railway.toml', 'railway.worker.toml']) {
-    const source = context.readText(file)
-    if (!source?.trim()) continue
-    const configured = source.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1]
-    values.push(configured ? displayPath(configured) : 'Dockerfile')
+type ArtifactParity = { mismatch: boolean, complete: boolean, evidence: string[] }
+
+function composeArtifact(value: Record<string, unknown>): string | null {
+  if (typeof value.image === 'string') return `image:${value.image}`
+  if (typeof value.build === 'string') return `build:${value.build}/Dockerfile`
+  if (isRecord(value.build)) {
+    const context = typeof value.build.context === 'string' ? value.build.context : '.'
+    const dockerfile = typeof value.build.dockerfile === 'string' ? value.build.dockerfile : 'Dockerfile'
+    return `build:${context}/${dockerfile}`
   }
-  return values
+  return null
+}
+
+function workerArtifactParity(context: ScanContext): ArtifactParity {
+  const evidence: string[] = []
+  let complete = true
+  let mismatch = false
+  if (workerDefinitions(context).includes('railway.worker.toml')) {
+    const web = context.readText('railway.toml')
+    const worker = context.readText('railway.worker.toml')
+    if (!web?.trim() || !worker?.trim()) complete = false
+    else {
+      const webArtifact = web.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1] ?? 'Dockerfile'
+      const workerArtifact = worker.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1] ?? 'Dockerfile'
+      evidence.push(`Railway web artifact: ${displayPath(webArtifact)}`, `Railway worker artifact: ${displayPath(workerArtifact)}`)
+      if (webArtifact !== workerArtifact) mismatch = true
+    }
+  }
+  const compose = context.readText('docker-compose.fullapp.yml')
+  if (compose) {
+    try {
+      const root: unknown = parse(compose, { merge: true })
+      if (isRecord(root) && isRecord(root.services)) {
+        const services = Object.entries(root.services).filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]))
+        const workers = services.filter(([name, value]) => {
+          const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
+          return isWorkerCommand(command)
+        })
+        if (workers.length) {
+          const web = services.find(([name, value]) => {
+            const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
+            return !isWorkerCommand(command) && /^(?:app|web|mercato)$/i.test(name)
+          })
+          if (!web) complete = false
+          else {
+            const webArtifact = composeArtifact(web[1])
+            if (!webArtifact) complete = false
+            for (const [name, value] of workers) {
+              const workerArtifact = composeArtifact(value)
+              if (!workerArtifact) complete = false
+              else {
+                evidence.push(`Compose web artifact: ${displayPath(webArtifact ?? 'unknown')}`, `Compose ${displayPath(name)} artifact: ${displayPath(workerArtifact)}`)
+                if (webArtifact !== workerArtifact) mismatch = true
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      complete = false
+    }
+  }
+  if (workerDefinitions(context).includes('scripts/railway-worker.sh')) complete = false
+  return { mismatch, complete, evidence }
 }
 
 function finalDockerUser(source: string): string | null {
@@ -283,20 +344,32 @@ function failureIsBlocking(value: unknown): boolean {
   return value === undefined || constantBoolean(value, false)
 }
 
+function shellPreservesFailure(value: unknown): boolean {
+  if (value === undefined) return true
+  if (typeof value !== 'string') return false
+  const tokens = value.trim().split(/\s+/)
+  const executable = tokens[0]?.split('/').at(-1)?.toLowerCase()
+  if (executable !== 'bash' && executable !== 'sh') return false
+  return tokens.some((token) => /^-[^-]*e[A-Za-z]*$/.test(token)) || /(?:^|\s)-o\s+errexit(?:\s|$)/i.test(value)
+}
+
 function workflowCommands(source: string): WorkflowCommand[] {
   const commands: WorkflowCommand[] = []
   for (const document of parseAllDocuments(source)) {
     if (document.errors.length) continue
     const root: unknown = document.toJS()
     if (!isRecord(root) || !isRecord(root.jobs)) continue
+    const workflowDefaults = isRecord(root.defaults) && isRecord(root.defaults.run) ? root.defaults.run : null
     for (const value of Object.values(root.jobs)) {
       if (!isRecord(value) || !Array.isArray(value.steps)) continue
       const jobRuns = alwaysRuns(value.if)
       const jobBlocking = failureIsBlocking(value['continue-on-error'])
+      const jobDefaults = isRecord(value.defaults) && isRecord(value.defaults.run) ? value.defaults.run : workflowDefaults
       for (const step of value.steps) {
         if (!isRecord(step) || typeof step.run !== 'string') continue
         const runs = jobRuns && alwaysRuns(step.if)
-        const blocking = jobBlocking && failureIsBlocking(step['continue-on-error'])
+        const shell = step.shell ?? jobDefaults?.shell
+        const blocking = jobBlocking && failureIsBlocking(step['continue-on-error']) && shellPreservesFailure(shell)
         if (runs && step.run.trim()) commands.push({ command: step.run, blocking })
       }
     }
@@ -314,7 +387,19 @@ function hasBlockingMigrationCommand(commands: WorkflowCommand[]): boolean {
 }
 
 function commandPreservesFailure(command: string): boolean {
-  return !/\|\||\bset\s+\+e\b|;\s*exit\s+0\b/i.test(command)
+  return !/\||\bset\s+\+e\b|;\s*exit\s+0\b/i.test(command)
+}
+
+function finalDependencyInstallIsImmutable(context: ScanContext): boolean {
+  const source = executableDeploymentText(context)
+  const installs = [...source.matchAll(/\b(yarn\s+install\b[^\n;&|]*|npm\s+(?:ci|install)\b[^\n;&|]*|pnpm\s+install\b[^\n;&|]*)/gi)]
+    .map((match) => match[1]?.trim() ?? '')
+    .filter(Boolean)
+  const finalInstall = installs.at(-1)
+  if (!finalInstall) return false
+  return /^npm\s+ci\b/i.test(finalInstall)
+    || /^yarn\s+install\b[^\n]*\s--(?:immutable|frozen-lockfile)(?:\s|$)/i.test(finalInstall)
+    || /^pnpm\s+install\b[^\n]*\s--frozen-lockfile(?:\s|$)/i.test(finalInstall)
 }
 
 function requiresNode24OrNewer(range: string): boolean {
@@ -430,6 +515,7 @@ export const RULES: readonly RuleDefinition[] = [
       const required = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options']
       const missing = required.filter((header) => !source.includes(header))
       if (!/X-Frame-Options|frame-ancestors/.test(source)) missing.push('frame protection')
+      if (!/(?:async\s+)?headers\s*\(\s*\)\s*\{|headers\s*:\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)/m.test(source)) missing.push('active Next.js headers configuration')
       return missing.length
         ? { status: 'fail', summary: 'The application configuration does not declare the complete security-header baseline.', evidence: missing.map((header) => `Missing header: ${header}`) }
         : { status: 'pass', summary: 'The application declares CSP, referrer, frame, and MIME-sniffing protection headers.' }
@@ -475,7 +561,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'supply-chain-immutable-install', title: 'Deployments use immutable dependency installation', category: 'Supply chain', severity: 'high',
     remediation: 'Commit one lockfile and use an immutable/frozen install in image and CI builds.',
-    check: (context) => /(?:^|&&|;|\bRUN\s+)(?:corepack\s+)?(?:yarn\s+install\s+--immutable|npm\s+ci\b|pnpm\s+install\s+--frozen-lockfile)/im.test(executableDeploymentText(context))
+    check: (context) => finalDependencyInstallIsImmutable(context)
       ? { status: 'pass', summary: 'Deployment configuration uses an immutable dependency install.' }
       : { status: 'fail', summary: 'No immutable dependency installation was found in deployment configuration.' },
   }),
@@ -561,11 +647,10 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Deploy one immutable build to web and worker roles and vary only the supported entrypoint.',
     check: (context) => {
       if (workerDefinitions(context).length === 0) return { status: 'skipped', summary: 'No separate worker process was detected.' }
-      const dockerfiles = workerDockerfiles(context)
-      if (dockerfiles.length < 2) return { status: 'warning', summary: 'Worker deployment exists, but artifact parity is controlled outside recognized repository files.' }
-      return new Set(dockerfiles).size === 1
-        ? { status: 'pass', summary: 'Web and worker deployment definitions use the same Dockerfile.', evidence: [`Shared build definition: ${dockerfiles[0]}`] }
-        : { status: 'fail', summary: 'Web and worker deployment definitions use different build artifacts.', evidence: dockerfiles.map((file) => `Build definition: ${file}`) }
+      const parity = workerArtifactParity(context)
+      if (parity.mismatch) return { status: 'fail', summary: 'Web and worker deployment definitions use different build artifacts.', evidence: parity.evidence }
+      if (!parity.complete) return { status: 'warning', summary: 'Worker deployment exists, but artifact parity cannot be proved across every detected surface.', evidence: parity.evidence }
+      return { status: 'pass', summary: 'Every detected web and worker deployment surface uses the same artifact.', evidence: parity.evidence }
     },
   }),
   rule({

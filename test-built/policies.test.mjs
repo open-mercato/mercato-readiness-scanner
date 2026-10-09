@@ -22,7 +22,7 @@ function fixture(files = {}) {
     '.gitignore': '.env\n.env.production\n.env.local\n.env.*.local\n!.env.example\n*.pem\n*.key\n.mcp.json\n.npmrc\n.ai/session-exports/\n',
     'yarn.lock': '# lock\n',
     Dockerfile: 'FROM node:24\nRUN yarn install --immutable\nUSER app\n',
-    'next.config.ts': "const headers = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options', 'X-Frame-Options']\nexport default { headers }\n",
+    'next.config.ts': "const securityHeaders = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options', 'X-Frame-Options']\nexport default { async headers() { return [{ source: '/:path*', headers: securityHeaders }] } }\n",
     'railway.toml': '[deploy]\nhealthcheckPath = "/api/healthz"\nstartCommand = "yarn db:migrate && yarn start"\n',
     'railway.worker.toml': '[deploy]\nstartCommand = "yarn mercato worker"\n',
     'docker-compose.fullapp.yml': 'services:\n  app:\n    volumes: ["uploads:/app/storage"]\n',
@@ -103,6 +103,24 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
     overwrite(root, '.github/workflows/release.yml', `${workflowPrefix}      - run: yarn test\n      - run: yarn db:migrate --check\n        continue-on-error: \${{ matrix.nonblocking }}\n`)
     assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
+
+    for (const testCommand of ['yarn test; true', 'yarn test\n          true', 'yarn test | tee test.log']) {
+      overwrite(root, '.github/workflows/release.yml', `${workflowPrefix}      - shell: bash {0}\n        run: |\n          ${testCommand}\n      - run: yarn db:migrate --check\n`)
+      assert.equal(scan(root).get('release-validation-gate')?.status, 'fail', testCommand)
+    }
+
+    overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "echo worker"\n')
+    assert.equal(scan(root).get('operations-worker-topology')?.status, 'fail')
+
+    overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "yarn mercato worker"\n')
+    overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    image: app:abcdef1\n  worker:\n    image: worker:fedcba9\n    command: yarn mercato worker\n')
+    assert.equal(scan(root).get('workers-release-parity')?.status, 'fail')
+
+    overwrite(root, 'next.config.ts', 'const unused = "Content-Security-Policy Referrer-Policy X-Content-Type-Options X-Frame-Options"\nexport default {}\n')
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+
+    overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
+    assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'fail')
 
     const safeTemplate = 'NODE_ENV=production\nAPP_URL=https://example.com\nDATABASE_URL=\nINTERNAL_APP_ORIGIN=\nPLATFORM_PRIMARY_HOST=\nRATE_LIMIT_TRUST_PROXY_DEPTH=1\nAPP_ALLOWED_ORIGINS=https://example.com\nCACHE_STRATEGY=redis\nREDIS_URL=\n'
     for (const enabled of ['QUERY_ENGINE_DEBUG_SQL=" true "', 'DEMO_MODE=enabled', 'PROFILE_MODE=y']) {

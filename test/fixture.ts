@@ -49,8 +49,8 @@ const FILES: Record<string, string> = {
     '.ai/session-exports/',
   ].join('\n'),
   'next.config.ts': [
-    "const headers = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options', 'X-Frame-Options']",
-    'export default { headers }',
+    "const securityHeaders = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options', 'X-Frame-Options']",
+    'export default { async headers() { return [{ source: "/:path*", headers: securityHeaders }] } }',
   ].join('\n'),
   Dockerfile: [
     'FROM node:24-alpine',
