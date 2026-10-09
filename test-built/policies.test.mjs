@@ -26,7 +26,7 @@ function fixture(files = {}) {
     'railway.toml': '[deploy]\nhealthcheckPath = "/api/healthz"\nstartCommand = "yarn db:migrate && yarn start"\n',
     'railway.worker.toml': '[deploy]\nstartCommand = "yarn mercato worker"\n',
     'docker-compose.fullapp.yml': 'services:\n  app:\n    volumes: ["uploads:/app/storage"]\n',
-    '.github/workflows/release.yml': 'jobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n',
+    '.github/workflows/release.yml': 'on:\n  push:\n    branches: [main]\njobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n',
     'docs/operations.md': 'TLS HTTPS certificate volume storage backup restore rollback worker\n',
   }
   for (const [relativePath, contents] of Object.entries({ ...defaults, ...files })) {
@@ -98,7 +98,7 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  redis:\n    image: redis:7\n    network_mode: host\n')
     assert.equal(scan(root).get('infrastructure-private-services')?.status, 'fail')
 
-    const workflowPrefix = 'jobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n'
+    const workflowPrefix = 'on:\n  push:\njobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n'
     overwrite(root, '.github/workflows/release.yml', `${workflowPrefix}      - run: yarn test || true\n      - run: yarn db:migrate --check\n`)
     assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
     overwrite(root, '.github/workflows/release.yml', `${workflowPrefix}      - run: yarn test\n      - run: yarn db:migrate --check\n        continue-on-error: \${{ matrix.nonblocking }}\n`)
@@ -113,6 +113,21 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
       overwrite(root, '.github/workflows/release.yml', `${workflowPrefix}${testStep}      - run: yarn db:migrate --check\n`)
       assert.equal(scan(root).get('release-validation-gate')?.status, 'fail', shell ?? 'default shell')
     }
+    overwrite(root, '.github/workflows/release.yml', 'on:\n  pull_request:\njobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n')
+    assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
+    overwrite(root, '.github/workflows/release.yml', 'on:\n  push:\njobs:\n  build:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n')
+    overwrite(root, '.github/workflows/other.yml', 'on:\n  push:\njobs:\n  verify:\n    steps:\n      - run: yarn test\n      - run: yarn db:migrate --check\n')
+    assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
+    fs.rmSync(path.join(root, '.github/workflows/other.yml'))
+
+    const manifestPath = path.join(root, 'package.json')
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'))
+    manifest.scripts = { build: 'NODE_ENV=production next build || true', start: 'next start' }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest))
+    assert.equal(scan(root).get('runtime-production-scripts')?.status, 'fail')
+    manifest.scripts = { build: 'NODE_ENV=production next build', start: 'next dev' }
+    fs.writeFileSync(manifestPath, JSON.stringify(manifest))
+    assert.equal(scan(root).get('runtime-production-scripts')?.status, 'fail')
 
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "echo worker"\n')
     assert.equal(scan(root).get('operations-worker-topology')?.status, 'fail')
@@ -134,6 +149,13 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     overwrite(root, 'next.config.ts', 'export default { async headers() { return [{ source: "/:path*", headers: [], decoy: [{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }] }] } }\n')
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
     overwrite(root, 'next.config.ts', 'const securityHeaders = [{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }]\nexport default { async headers() { const securityHeaders = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options"]; return [{ source: "/:path*", headers: securityHeaders }] } }\n')
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    const validHeaders = '[{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }]'
+    overwrite(root, 'next.config.ts', `const decoy = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }\nexport default { async headers() { return [] } }\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { function decoy() { return [{ source: "/:path*", headers: ${validHeaders} }] } return [] } }\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `function decoy() { const securityHeaders = ${validHeaders}; return securityHeaders }\nexport default { async headers() { return [{ source: "/:path*", headers: securityHeaders }] } }\n`)
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')

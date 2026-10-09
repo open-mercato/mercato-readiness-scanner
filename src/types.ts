@@ -107,4 +107,5 @@ export type ScanContext = {
   readText: (relativePath: string) => string | null
   collectDeploymentText: () => string
   collectCiText: () => string
+  collectCiWorkflows: () => ReadonlyArray<{ path: string, source: string }>
 }
