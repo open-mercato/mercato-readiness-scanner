@@ -51,6 +51,12 @@ test('accepts only explicit loopback Compose bindings for recognized stateful se
       '      - target: 9200',
       '        published: 9200',
       '        host_ip: 127.0.0.1',
+      '  database:',
+      '    image: postgres:17',
+      '    ports:',
+      '      - host_ip: "::1"',
+      '        published: 5432',
+      '        target: 5432',
     ].join('\n'))
     assert.equal(status(root, 'infrastructure-private-services'), 'pass')
   } finally {
@@ -83,6 +89,19 @@ test('counts only active blocking workflow commands as release validation', () =
       '    steps:',
       '      # yarn generate && yarn build && yarn test && yarn db:migrate',
       '      - run: echo no-op',
+    ].join('\n'))
+    assert.equal(status(root, 'release-validation-gate'), 'fail')
+
+    overwrite(root, '.github/workflows/release.yml', [
+      'jobs:',
+      '  validate:',
+      '    steps:',
+      '      - run: yarn generate',
+      '      - run: yarn build',
+      '      - run: yarn test',
+      '        continue-on-error: "${{ true }}"',
+      '      - if: "${{ false }}"',
+      '        run: yarn db:migrate --check',
     ].join('\n'))
     assert.equal(status(root, 'release-validation-gate'), 'fail')
 
@@ -144,7 +163,9 @@ test('treats only explicitly enabled development switches as unsafe defaults', (
   try {
     fs.appendFileSync(path.join(root, '.env.example'), '\nAUTOLOGIN_ENABLED=false\nAUTOLOGIN_TOKEN=\n')
     assert.equal(status(root, 'runtime-debug-features-disabled'), 'warning')
-    fs.appendFileSync(path.join(root, '.env.example'), 'DEBUG_MODE=true\n')
+    fs.appendFileSync(path.join(root, '.env.example'), 'DEBUG_MODE="false"\nPROFILE_MODE=\'false\'\n')
+    assert.equal(status(root, 'runtime-debug-features-disabled'), 'warning')
+    fs.appendFileSync(path.join(root, '.env.example'), 'AUTOLOGIN_ENABLED="true"\n')
     assert.equal(status(root, 'runtime-debug-features-disabled'), 'fail')
   } finally {
     removeFixture(root)
@@ -156,12 +177,12 @@ test('rejects Node engine ranges with any unsupported alternative', () => {
   try {
     const packagePath = path.join(root, 'package.json')
     const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8')) as { engines: { node: string } }
-    for (const range of ['>=24', '^24.0.0', '24.x', '=24.0.0', '24.0.0 - 26.0.0', '>=24 <27', '24 || >=26']) {
+    for (const range of ['>=24', '>23', '>23.x', '^24.0.0', '24.x', '=24.0.0', '24.0.0 - 26.0.0', '>=24 <27', '24 || >=26']) {
       packageJson.engines.node = range
       fs.writeFileSync(packagePath, JSON.stringify(packageJson))
       assert.equal(status(root, 'runtime-supported-node'), 'pass', range)
     }
-    for (const range of ['>=18 <19 || >=24', '>=18', '<25', '23.x', '*', 'not-a-range']) {
+    for (const range of ['>=18 <19 || >=24', '>=18', '<25', '23.x', '*', 'not-a-range', '24 ||', '|| 24', '24 || || 26']) {
       packageJson.engines.node = range
       fs.writeFileSync(packagePath, JSON.stringify(packageJson))
       assert.equal(status(root, 'runtime-supported-node'), 'fail', range)

@@ -1,3 +1,6 @@
+import { parseEnv } from 'node:util'
+import { minVersion, validRange } from 'semver'
+import { parse, parseAllDocuments } from 'yaml'
 import { isLiveEnvPath } from './files.js'
 import type { RuleCheck, RuleDefinition, ScanContext, Severity } from './types.js'
 
@@ -44,11 +47,14 @@ function templateInventory(context: ScanContext): TemplateInventory {
   const booleans = new Map<string, boolean>()
   const integers = new Map<string, number>()
   const enums = new Map<string, string>()
-  for (const line of source.split(/\r?\n/)) {
-    const match = line.match(/^([A-Z][A-Z0-9_]*)=(.*)$/)
-    if (match?.[1] === undefined || match[2] === undefined) continue
-    const key = match[1]
-    const rawValue = match[2].trim()
+  let values: Record<string, string | undefined> = {}
+  try {
+    values = parseEnv(source)
+  } catch {
+    values = {}
+  }
+  for (const [key, rawValue] of Object.entries(values)) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || rawValue === undefined) continue
     names.add(key)
     if (/(?:DEBUG|PROFILE|DEVTOOLS|AUTOLOGIN|TEST_INJECT|DEMO_MODE|EMERGENCY_BYPASS|INTEGRATION_TEST|AUTO_SPAWN_WORKERS)/.test(key)) {
       if (/^(?:1|true|yes|on)$/i.test(rawValue)) booleans.set(key, true)
@@ -85,37 +91,8 @@ function trackedCredentialPath(relativePath: string): boolean {
     || /(?:^|\/)\.(?:codex|cursor)\/mcp\.json$/i.test(normalized)
 }
 
-type ComposeService = { name: string, lines: string[] }
-
-function composeServices(source: string): ComposeService[] {
-  const services: ComposeService[] = []
-  let servicesIndent: number | null = null
-  let serviceIndent: number | null = null
-  let current: ComposeService | null = null
-  for (const line of source.split(/\r?\n/)) {
-    const servicesMatch = line.match(/^(\s*)services:\s*(?:#.*)?$/)
-    if (servicesMatch) {
-      servicesIndent = servicesMatch[1]?.length ?? 0
-      continue
-    }
-    if (servicesIndent === null) continue
-    if (!line.trim() || /^\s*#/.test(line)) {
-      if (current) current.lines.push(line)
-      continue
-    }
-    const indent = line.length - line.trimStart().length
-    if (indent <= servicesIndent) break
-    const serviceMatch = line.match(/^(\s*)([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)
-    if (serviceIndent === null && serviceMatch?.[2]) serviceIndent = indent
-    if (serviceMatch?.[2] && indent === serviceIndent) {
-      if (current) services.push(current)
-      current = { name: serviceMatch[2], lines: [] }
-      continue
-    }
-    if (current) current.lines.push(line)
-  }
-  if (current && !services.includes(current)) services.push(current)
-  return services
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
 function isLoopbackBinding(value: string): boolean {
@@ -123,57 +100,8 @@ function isLoopbackBinding(value: string): boolean {
   return /^(?:127(?:\.\d{1,3}){3}|localhost):/i.test(normalized) || /^\[::1\]:/.test(normalized)
 }
 
-function inlinePortValues(value: string): string[] | null {
-  const trimmed = value.trim()
-  if (!trimmed.startsWith('[') || !trimmed.endsWith(']')) return null
-  const body = trimmed.slice(1, -1).trim()
-  if (!body) return []
-  const values: string[] = []
-  for (const part of body.split(',')) {
-    const token = part.trim().replace(/^['"]|['"]$/g, '')
-    if (!token || /[{}]/.test(token)) return null
-    values.push(token)
-  }
-  return values
-}
-
-function servicePortFindings(file: string, service: ComposeService): string[] {
-  const findings: string[] = []
-  for (let index = 0; index < service.lines.length; index += 1) {
-    const line = service.lines[index] ?? ''
-    const ports = line.match(/^(\s*)ports:\s*(.*?)\s*(?:#.*)?$/)
-    if (!ports) continue
-    const portsIndent = ports[1]?.length ?? 0
-    const inline = ports[2] ?? ''
-    if (inline) {
-      const values = inlinePortValues(inline)
-      if (values === null) findings.push(`${file}: ${service.name} uses unsupported inline ports syntax`)
-      else for (const binding of values) if (!isLoopbackBinding(binding)) findings.push(`${file}: ${service.name} publishes ${displayPath(binding)}`)
-      continue
-    }
-    for (let nested = index + 1; nested < service.lines.length; nested += 1) {
-      const nestedLine = service.lines[nested] ?? ''
-      const indent = nestedLine.length - nestedLine.trimStart().length
-      if (nestedLine.trim() && indent <= portsIndent) break
-      const item = nestedLine.match(/^\s*-\s*(.*?)\s*(?:#.*)?$/)?.[1]
-      if (item === undefined) continue
-      if (/^target\s*:/.test(item)) {
-        let hostIp = ''
-        for (let field = nested; field < service.lines.length; field += 1) {
-          const fieldLine = service.lines[field] ?? ''
-          const fieldIndent = fieldLine.length - fieldLine.trimStart().length
-          if (field > nested && fieldLine.trim() && fieldIndent <= indent) break
-          const hostMatch = fieldLine.match(/^\s*host_ip\s*:\s*["']?([^\s"']+)/)
-          if (hostMatch?.[1]) hostIp = hostMatch[1]
-        }
-        if (!/^(?:127(?:\.\d{1,3}){3}|localhost|::1)$/i.test(hostIp)) findings.push(`${file}: ${service.name} publishes a long-syntax port`)
-        continue
-      }
-      if (!item || /[{}]/.test(item)) findings.push(`${file}: ${service.name} uses unsupported ports syntax`)
-      else if (!isLoopbackBinding(item)) findings.push(`${file}: ${service.name} publishes ${displayPath(item)}`)
-    }
-  }
-  return findings
+function isLoopbackHost(value: unknown): boolean {
+  return typeof value === 'string' && /^(?:127(?:\.\d{1,3}){3}|localhost|::1)$/i.test(value.trim())
 }
 
 function composePublicBindings(context: ScanContext): string[] {
@@ -181,10 +109,36 @@ function composePublicBindings(context: ScanContext): string[] {
   for (const file of ['docker-compose.yml', 'docker-compose.fullapp.yml']) {
     const source = context.readText(file)
     if (!source) continue
-    for (const service of composeServices(source)) {
-      const body = service.lines.join('\n')
-      if (!/(?:postgres|redis|search|opensearch|elastic|meili)/i.test(`${service.name}\n${body.match(/^\s*image:\s*(.*)$/mi)?.[1] ?? ''}`)) continue
-      findings.push(...servicePortFindings(file, service))
+    let root: unknown
+    try {
+      root = parse(source)
+    } catch {
+      findings.push(`${file}: Compose configuration could not be safely parsed`)
+      continue
+    }
+    if (!isRecord(root) || !isRecord(root.services)) {
+      findings.push(`${file}: Compose services could not be safely inspected`)
+      continue
+    }
+    for (const [name, value] of Object.entries(root.services)) {
+      if (!isRecord(value)) continue
+      const image = typeof value.image === 'string' ? value.image : ''
+      if (!/(?:postgres|redis|search|opensearch|elastic|meili)/i.test(`${name}\n${image}`)) continue
+      if (value.ports === undefined) continue
+      if (!Array.isArray(value.ports)) {
+        findings.push(`${file}: ${name} uses unsupported ports syntax`)
+        continue
+      }
+      for (const port of value.ports) {
+        if (typeof port === 'string' || typeof port === 'number') {
+          const binding = String(port)
+          if (!isLoopbackBinding(binding)) findings.push(`${file}: ${name} publishes ${displayPath(binding)}`)
+        } else if (isRecord(port)) {
+          if (!isLoopbackHost(port.host_ip)) findings.push(`${file}: ${name} publishes a long-syntax port`)
+        } else {
+          findings.push(`${file}: ${name} uses unsupported ports syntax`)
+        }
+      }
     }
   }
   return findings
@@ -218,120 +172,30 @@ function finalDockerUser(source: string): string | null {
 
 type WorkflowCommand = { command: string, blocking: boolean }
 
-function yamlFalse(value: string): boolean {
-  return /^(?:false|['"]false['"]|\$\{\{\s*false\s*\}\})\s*$/i.test(value.trim())
-}
-
-function yamlTrue(value: string): boolean {
-  return /^(?:true|['"]true['"]|\$\{\{\s*true\s*\}\})\s*$/i.test(value.trim())
-}
-
-function indentation(line: string): number {
-  return line.length - line.trimStart().length
+function constantBoolean(value: unknown, expected: boolean): boolean {
+  if (value === expected) return true
+  if (typeof value !== 'string') return false
+  const token = expected ? 'true' : 'false'
+  return new RegExp(`^(?:${token}|\\$\\{\\{\\s*${token}\\s*\\}\\})$`, 'i').test(value.trim())
 }
 
 function workflowCommands(source: string): WorkflowCommand[] {
-  const lines = source.split(/\r?\n/)
   const commands: WorkflowCommand[] = []
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index] ?? ''
-    const runMatch = line.match(/^(\s*)(-\s*)?run:\s*(.*?)\s*$/)
-    if (!runMatch) continue
-    const runIndent = (runMatch[1]?.length ?? 0) + (runMatch[2]?.length ?? 0)
-    let stepStart = index
-    for (let previous = index; previous >= 0; previous -= 1) {
-      const candidate = lines[previous] ?? ''
-      const listMatch = candidate.match(/^(\s*)-\s+/)
-      if (listMatch && (listMatch[1]?.length ?? 0) < runIndent) {
-        stepStart = previous
-        break
+  for (const document of parseAllDocuments(source)) {
+    if (document.errors.length) continue
+    const root: unknown = document.toJS()
+    if (!isRecord(root) || !isRecord(root.jobs)) continue
+    for (const value of Object.values(root.jobs)) {
+      if (!isRecord(value) || !Array.isArray(value.steps)) continue
+      const jobDisabled = constantBoolean(value.if, false)
+      const jobNonBlocking = constantBoolean(value['continue-on-error'], true)
+      for (const step of value.steps) {
+        if (!isRecord(step) || typeof step.run !== 'string') continue
+        const disabled = jobDisabled || constantBoolean(step.if, false)
+        const nonBlocking = jobNonBlocking || constantBoolean(step['continue-on-error'], true)
+        if (!disabled && step.run.trim()) commands.push({ command: step.run, blocking: !nonBlocking })
       }
     }
-    const stepIndent = indentation(lines[stepStart] ?? '')
-    let stepEnd = lines.length
-    for (let candidate = stepStart + 1; candidate < lines.length; candidate += 1) {
-      const candidateLine = lines[candidate] ?? ''
-      if (!candidateLine.trim() || /^\s*#/.test(candidateLine)) continue
-      const candidateIndent = indentation(candidateLine)
-      if (candidateIndent < stepIndent || (candidateIndent === stepIndent && /^\s*-\s+/.test(candidateLine))) {
-        stepEnd = candidate
-        break
-      }
-    }
-    let jobsStart = -1
-    for (let previous = index; previous >= 0; previous -= 1) {
-      if (/^\s*jobs:\s*(?:#.*)?$/.test(lines[previous] ?? '')) {
-        jobsStart = previous
-        break
-      }
-    }
-    let jobStart = -1
-    let jobEnd = lines.length
-    let jobIndent: number | null = null
-    let jobsIndent: number | null = null
-    if (jobsStart >= 0) {
-      jobsIndent = indentation(lines[jobsStart] ?? '')
-      for (let candidate = jobsStart + 1; candidate <= index; candidate += 1) {
-        const candidateLine = lines[candidate] ?? ''
-        if (!candidateLine.trim() || /^\s*#/.test(candidateLine)) continue
-        const candidateIndent = indentation(candidateLine)
-        if (candidateIndent <= jobsIndent) break
-        const key = candidateLine.match(/^\s*([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)?.[1]
-        if (jobIndent === null && key) jobIndent = candidateIndent
-        if (key && candidateIndent === jobIndent) jobStart = candidate
-      }
-      if (jobStart >= 0 && jobIndent !== null) {
-        for (let candidate = jobStart + 1; candidate < lines.length; candidate += 1) {
-          const candidateLine = lines[candidate] ?? ''
-          if (!candidateLine.trim() || /^\s*#/.test(candidateLine)) continue
-          const candidateIndent = indentation(candidateLine)
-          const key = candidateLine.match(/^\s*([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)?.[1]
-          if (candidateIndent <= jobsIndent || (key && candidateIndent === jobIndent)) {
-            jobEnd = candidate
-            break
-          }
-        }
-      }
-    }
-    const stepLines = lines.slice(stepStart, stepEnd)
-    const stepFieldIndent = stepLines.reduce<number | null>((minimum, candidate, offset) => {
-      if (offset === 0 || !candidate.trim() || /^\s*#/.test(candidate)) return minimum
-      const candidateIndent = indentation(candidate)
-      if (candidateIndent <= stepIndent) return minimum
-      return minimum === null ? candidateIndent : Math.min(minimum, candidateIndent)
-    }, null)
-    const stepControl = stepLines.filter((candidate, offset) => offset === 0 || (stepFieldIndent !== null && indentation(candidate) === stepFieldIndent))
-    const jobLines = jobStart >= 0 ? lines.slice(jobStart + 1, jobEnd) : []
-    const jobFieldIndent = jobIndent === null
-      ? null
-      : jobLines.reduce<number | null>((minimum, candidate) => {
-        if (!candidate.trim() || /^\s*#/.test(candidate)) return minimum
-        const candidateIndent = indentation(candidate)
-        if (candidateIndent <= jobIndent) return minimum
-        return minimum === null ? candidateIndent : Math.min(minimum, candidateIndent)
-      }, null)
-    const jobControl = jobFieldIndent === null ? [] : jobLines.filter((candidate) => indentation(candidate) === jobFieldIndent)
-    const disabled = [...stepControl, ...jobControl].some((candidate) => {
-      const condition = candidate.match(/^\s*(?:-\s*)?if:\s*(.*?)\s*(?:#.*)?$/)?.[1]
-      return condition !== undefined && yamlFalse(condition)
-    })
-    const nonBlocking = [...stepControl, ...jobControl].some((candidate) => {
-      const value = candidate.match(/^\s*(?:-\s*)?continue-on-error:\s*(.*?)\s*(?:#.*)?$/i)?.[1]
-      return value !== undefined && yamlTrue(value)
-    })
-    let command = runMatch[3] ?? ''
-    if (/^[|>][-+]?\s*$/.test(command)) {
-      const block: string[] = []
-      for (let nested = index + 1; nested < lines.length; nested += 1) {
-        const nestedLine = lines[nested] ?? ''
-        const indent = nestedLine.length - nestedLine.trimStart().length
-        if (nestedLine.trim() && indent <= runIndent) break
-        if (!/^\s*#/.test(nestedLine)) block.push(nestedLine.trim())
-      }
-      command = block.join('\n')
-    }
-    command = command.replace(/^['"]|['"]$/g, '')
-    if (!disabled && command) commands.push({ command, blocking: !nonBlocking })
   }
   return commands
 }
@@ -346,32 +210,10 @@ function hasBlockingMigrationCommand(commands: WorkflowCommand[]): boolean {
 }
 
 function requiresNode24OrNewer(range: string): boolean {
-  const clauses = range.split('||').map((clause) => clause.trim()).filter(Boolean)
-  if (!clauses.length) return false
-  return clauses.every((clause) => {
-    const hyphen = clause.match(/^v?(\d+)(?:\.(?:\d+|[x*])){0,2}(?:-[0-9A-Za-z.-]+)?\s+-\s+v?\d+(?:\.(?:\d+|[x*])){0,2}(?:-[0-9A-Za-z.-]+)?$/i)
-    if (hyphen?.[1]) return Number(hyphen[1]) >= 24
-    const normalized = clause.replace(/(<=|>=|<|>|=|\^|~)\s+/g, '$1')
-    const tokens = normalized.split(/\s+/).filter(Boolean)
-    let strongestLowerMajor: number | null = null
-    let exactMajor: number | null = null
-    for (const token of tokens) {
-      if (token === '*' || /^x$/i.test(token)) return false
-      const match = token.match(/^(<=|>=|<|>|=|\^|~)?v?(\d+)(?:\.(?:\d+|[x*])){0,2}(?:-[0-9A-Za-z.-]+)?$/i)
-      if (!match?.[2]) return false
-      const operator = match[1] ?? '='
-      const major = Number(match[2])
-      if (operator === '<' || operator === '<=') continue
-      if (operator === '=') {
-        if (exactMajor !== null && exactMajor !== major) return false
-        exactMajor = major
-      }
-      if (operator === '>' && major < 24) continue
-      strongestLowerMajor = strongestLowerMajor === null ? major : Math.max(strongestLowerMajor, major)
-    }
-    if (exactMajor !== null && exactMajor < 24) return false
-    return strongestLowerMajor !== null && strongestLowerMajor >= 24
-  })
+  if (range.split('||').some((clause) => !clause.trim())) return false
+  if (validRange(range) === null) return false
+  const minimum = minVersion(range)
+  return minimum !== null && minimum.major >= 24
 }
 
 export const RULES: readonly RuleDefinition[] = [

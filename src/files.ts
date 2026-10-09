@@ -127,7 +127,7 @@ export function collectDeploymentText(root: string): string {
 
 export function collectCiText(root: string): string {
   const files = collectTextFiles(root, '.github/workflows', /\.(?:yml|yaml)$/i)
-  return files.map((file) => readSafeText(root, file)).filter((value): value is string => value !== null).join('\n')
+  return files.map((file) => readSafeText(root, file)).filter((value): value is string => value !== null).join('\n---\n')
 }
 
 export function isLiveEnvPath(relativePath: string): boolean {
