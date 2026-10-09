@@ -315,6 +315,15 @@ function workerArtifactParity(context: ScanContext): ArtifactParity {
     }
     if (!webs.length) {
       complete = false
+      for (const [name, value] of workers) {
+        const workerArtifact = composeArtifact(value)
+        if (!workerArtifact) continue
+        evidence.push(`${file} ${displayPath(name)} artifact: ${displayPath(workerArtifact)}`)
+        const kind = workerArtifact.split(':', 1)[0] ?? ''
+        const known = comparableArtifacts.get(kind) ?? new Set<string>()
+        known.add(workerArtifact)
+        comparableArtifacts.set(kind, known)
+      }
       continue
     }
     const webArtifacts = webs.map(([name, value]) => ({ name, artifact: composeArtifact(value) }))
@@ -506,6 +515,15 @@ function extractDelimitedBody(source: string, openingIndex: number, opening: str
   return null
 }
 
+function declaredArray(scope: string, identifier: string): string | null {
+  const pattern = new RegExp(`(?:const|let|var)\\s+${identifier.replace(/[$]/g, '\\$&')}\\s*=\\s*\\[`, 'gm')
+  let selected: RegExpExecArray | null = null
+  for (const match of scope.matchAll(pattern)) selected = match
+  if (!selected) return null
+  const openingBracket = scope.indexOf('[', selected.index)
+  return extractDelimitedBody(scope, openingBracket, '[', ']')
+}
+
 function activeHeaderEntries(source: string): Map<string, string> {
   const entries = new Map<string, string>()
   const functionMatch = /(?:async\s+)?headers\s*\(\s*\)\s*\{|headers\s*:\s*(?:async\s*)?(?:function\s*\([^)]*\)|\([^)]*\)\s*=>)\s*\{/m.exec(source)
@@ -518,14 +536,22 @@ function activeHeaderEntries(source: string): Map<string, string> {
   const openingBracket = body.indexOf('[', returned.index)
   const returnedEntries = extractDelimitedBody(body, openingBracket, '[', ']')
   if (!returnedEntries) return entries
-  const evidence = [returnedEntries]
-  for (const match of returnedEntries.matchAll(/\bheaders\s*:\s*([A-Za-z_$][\w$]*)\b/g)) {
-    const identifier = match[1]
+  const headerArrays: string[] = []
+  for (const match of returnedEntries.matchAll(/\bheaders\s*:\s*/g)) {
+    const valueStart = (match.index ?? 0) + match[0].length
+    const remainder = returnedEntries.slice(valueStart)
+    if (remainder.startsWith('[')) {
+      const inline = extractDelimitedBody(returnedEntries, valueStart, '[', ']')
+      if (inline) headerArrays.push(inline)
+      continue
+    }
+    const identifier = remainder.match(/^([A-Za-z_$][\w$]*)\b/)?.[1]
     if (!identifier) continue
-    const declaration = new RegExp(`(?:const|let|var)\\s+${identifier.replace(/[$]/g, '\\$&')}\\s*=\\s*\\[([\\s\\S]*?)\\]`, 'm').exec(source)
-    if (declaration?.[0]) evidence.push(declaration[0])
+    const local = declaredArray(body.slice(0, returned.index), identifier)
+    const global = local ?? declaredArray(source.slice(0, functionMatch.index), identifier)
+    if (global) headerArrays.push(global)
   }
-  for (const object of evidence.join('\n').match(/\{[^{}]*\}/g) ?? []) {
+  for (const object of headerArrays.join('\n').match(/\{[^{}]*\}/g) ?? []) {
     const key = object.match(/\bkey\s*:\s*["']([^"']+)["']/)?.[1]
     if (key && /\bvalue\s*:/.test(object)) entries.set(key, object)
   }

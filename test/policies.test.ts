@@ -295,6 +295,10 @@ test('requires effective worker and command evidence instead of comments or empt
     assert.equal(status(root, 'edge-security-headers'), 'fail')
     overwrite(root, 'next.config.ts', 'const securityHeaders = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options", "X-Frame-Options"]\nexport default { async headers() { return [{ source: "/:path*", headers: securityHeaders }] } }\n')
     assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', 'export default { async headers() { return [{ source: "/:path*", headers: [], decoy: [{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }] }] } }\n')
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', 'const securityHeaders = [{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }]\nexport default { async headers() { const securityHeaders = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options"]; return [{ source: "/:path*", headers: securityHeaders }] } }\n')
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
     assert.equal(status(root, 'supply-chain-immutable-install'), 'fail')
@@ -327,6 +331,10 @@ test('requires effective worker and command evidence instead of comments or empt
 
     overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:1111111\n  web:\n    image: app:2222222\n  worker:\n    image: app:1111111\n    command: yarn mercato worker\n')
     overwrite(root, 'docker-compose.fullapp.yml', '')
+    assert.equal(status(root, 'workers-release-parity'), 'fail')
+
+    overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:1111111\n')
+    overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  worker:\n    image: app:2222222\n    command: yarn mercato worker\n')
     assert.equal(status(root, 'workers-release-parity'), 'fail')
   } finally {
     removeFixture(root)
