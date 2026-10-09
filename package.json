@@ -19,8 +19,9 @@
     "build": "tsc -p tsconfig.json && node scripts/finalize-build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
+    "test:built": "node --test test-built/*.test.mjs",
     "pack:check": "node scripts/check-package.mjs",
-    "check": "npm run typecheck && npm test && npm run build && npm run pack:check"
+    "check": "npm run typecheck && npm test && npm run build && npm run test:built && npm run pack:check"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",

@@ -77,8 +77,9 @@ export function readSafeText(root: string, relativePath: string): string | null 
 }
 
 export function gitTrackedFiles(root: string): ReadonlySet<string> | null {
-  const result = spawnSync('git', ['ls-files', '-z'], {
+  const result = spawnSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', 'ls-files', '-z'], {
     cwd: root,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_CONFIG_NOSYSTEM: '1' },
     encoding: 'utf8',
     timeout: 5_000,
     maxBuffer: 4 * MAX_TEXT_BYTES,

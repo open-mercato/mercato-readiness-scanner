@@ -57,7 +57,8 @@ loads the application, contacts its services, or performs network probes.
 
 Live `.env*` files are never opened. Git is queried only for tracked path names
 so the scanner can report a committed live environment file without reading its
-contents. Only the explicitly sanitized `.env.example`, `.env.sample`, and
+contents. Repository hooks, filesystem monitors, and optional Git locks are
+disabled for that read-only query. Only the explicitly sanitized `.env.example`, `.env.sample`, and
 `.env.template` forms are eligible for configuration-name checks. Evidence omits
 absolute paths and configuration values.
 

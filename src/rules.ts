@@ -85,32 +85,101 @@ function trackedCredentialPath(relativePath: string): boolean {
     || /(?:^|\/)\.(?:codex|cursor)\/mcp\.json$/i.test(normalized)
 }
 
+type ComposeService = { name: string, lines: string[] }
+
+function composeServices(source: string): ComposeService[] {
+  const services: ComposeService[] = []
+  let inServices = false
+  let current: ComposeService | null = null
+  for (const line of source.split(/\r?\n/)) {
+    if (/^services:\s*(?:#.*)?$/.test(line)) {
+      inServices = true
+      continue
+    }
+    if (inServices && /^\S[^:]*:\s*/.test(line)) {
+      if (current) services.push(current)
+      break
+    }
+    if (!inServices) continue
+    const serviceMatch = line.match(/^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)
+    if (serviceMatch?.[1]) {
+      if (current) services.push(current)
+      current = { name: serviceMatch[1], lines: [] }
+      continue
+    }
+    if (current) current.lines.push(line)
+  }
+  if (current && !services.includes(current)) services.push(current)
+  return services
+}
+
+function isLoopbackBinding(value: string): boolean {
+  const normalized = value.replace(/^['"]|['"]$/g, '').trim()
+  return /^(?:127(?:\.\d{1,3}){3}|localhost):/i.test(normalized) || /^\[::1\]:/.test(normalized)
+}
+
+function inlinePortValues(value: string): string[] | null {
+  const trimmed = value.trim()
+  if (!trimmed.startsWith('[') || !trimmed.endsWith(']')) return null
+  const body = trimmed.slice(1, -1).trim()
+  if (!body) return []
+  const values: string[] = []
+  for (const part of body.split(',')) {
+    const token = part.trim().replace(/^['"]|['"]$/g, '')
+    if (!token || /[{}]/.test(token)) return null
+    values.push(token)
+  }
+  return values
+}
+
+function servicePortFindings(file: string, service: ComposeService): string[] {
+  const findings: string[] = []
+  for (let index = 0; index < service.lines.length; index += 1) {
+    const line = service.lines[index] ?? ''
+    const ports = line.match(/^(\s*)ports:\s*(.*?)\s*(?:#.*)?$/)
+    if (!ports) continue
+    const portsIndent = ports[1]?.length ?? 0
+    const inline = ports[2] ?? ''
+    if (inline) {
+      const values = inlinePortValues(inline)
+      if (values === null) findings.push(`${file}: ${service.name} uses unsupported inline ports syntax`)
+      else for (const binding of values) if (!isLoopbackBinding(binding)) findings.push(`${file}: ${service.name} publishes ${displayPath(binding)}`)
+      continue
+    }
+    for (let nested = index + 1; nested < service.lines.length; nested += 1) {
+      const nestedLine = service.lines[nested] ?? ''
+      const indent = nestedLine.length - nestedLine.trimStart().length
+      if (nestedLine.trim() && indent <= portsIndent) break
+      const item = nestedLine.match(/^\s*-\s*(.*?)\s*(?:#.*)?$/)?.[1]
+      if (item === undefined) continue
+      if (/^target\s*:/.test(item)) {
+        let hostIp = ''
+        for (let field = nested; field < service.lines.length; field += 1) {
+          const fieldLine = service.lines[field] ?? ''
+          const fieldIndent = fieldLine.length - fieldLine.trimStart().length
+          if (field > nested && fieldLine.trim() && fieldIndent <= indent) break
+          const hostMatch = fieldLine.match(/^\s*host_ip\s*:\s*["']?([^\s"']+)/)
+          if (hostMatch?.[1]) hostIp = hostMatch[1]
+        }
+        if (!/^(?:127(?:\.\d{1,3}){3}|localhost|::1)$/i.test(hostIp)) findings.push(`${file}: ${service.name} publishes a long-syntax port`)
+        continue
+      }
+      if (!item || /[{}]/.test(item)) findings.push(`${file}: ${service.name} uses unsupported ports syntax`)
+      else if (!isLoopbackBinding(item)) findings.push(`${file}: ${service.name} publishes ${displayPath(item)}`)
+    }
+  }
+  return findings
+}
+
 function composePublicBindings(context: ScanContext): string[] {
   const findings: string[] = []
   for (const file of ['docker-compose.yml', 'docker-compose.fullapp.yml']) {
     const source = context.readText(file)
     if (!source) continue
-    const lines = source.split(/\r?\n/)
-    let service: string | null = null
-    let portsIndent = -1
-    for (const line of lines) {
-      const serviceMatch = line.match(/^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)
-      if (serviceMatch?.[1]) {
-        service = serviceMatch[1]
-        portsIndent = -1
-        continue
-      }
-      if (!service || !/(?:postgres|redis|search|opensearch|elastic|meili)/i.test(service)) continue
-      const indent = line.length - line.trimStart().length
-      if (/^\s+ports:\s*(?:#.*)?$/.test(line)) {
-        portsIndent = indent
-        continue
-      }
-      if (portsIndent >= 0 && indent <= portsIndent && line.trim()) portsIndent = -1
-      if (portsIndent < 0) continue
-      const binding = line.match(/^\s+-\s*["']?([^"'#]+)["']?/)?.[1]?.trim()
-      if (!binding || /^(?:127\.0\.0\.1|localhost):/.test(binding)) continue
-      findings.push(`${file}: ${service} publishes ${displayPath(binding)}`)
+    for (const service of composeServices(source)) {
+      const body = service.lines.join('\n')
+      if (!/(?:postgres|redis|search|opensearch|elastic|meili)/i.test(`${service.name}\n${body.match(/^\s*image:\s*(.*)$/mi)?.[1] ?? ''}`)) continue
+      findings.push(...servicePortFindings(file, service))
     }
   }
   return findings
@@ -125,6 +194,98 @@ function workerDockerfiles(context: ScanContext): string[] {
     values.push(configured ? displayPath(configured) : 'Dockerfile')
   }
   return values
+}
+
+function finalDockerUser(source: string): string | null {
+  const lines = source.split(/\r?\n/)
+  let finalStageStart = -1
+  for (let index = 0; index < lines.length; index += 1) {
+    if (/^\s*FROM\s+/i.test(lines[index] ?? '')) finalStageStart = index
+  }
+  if (finalStageStart < 0) return null
+  let user: string | null = null
+  for (const line of lines.slice(finalStageStart + 1)) {
+    const match = line.match(/^\s*USER\s+([^\s#]+)/i)
+    if (match?.[1]) user = match[1].toLowerCase()
+  }
+  return user
+}
+
+type WorkflowCommand = { command: string, blocking: boolean }
+
+function yamlFalse(value: string): boolean {
+  return /^(?:false|['"]false['"]|\$\{\{\s*false\s*\}\})\s*$/i.test(value.trim())
+}
+
+function workflowCommands(source: string): WorkflowCommand[] {
+  const lines = source.split(/\r?\n/)
+  const commands: WorkflowCommand[] = []
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? ''
+    const runMatch = line.match(/^(\s*)(?:-\s*)?run:\s*(.*?)\s*$/)
+    if (!runMatch) continue
+    const runIndent = runMatch[1]?.length ?? 0
+    let stepStart = index
+    for (let previous = index; previous >= 0; previous -= 1) {
+      const candidate = lines[previous] ?? ''
+      const listMatch = candidate.match(/^(\s*)-\s+/)
+      if (listMatch && (listMatch[1]?.length ?? 0) <= runIndent) {
+        stepStart = previous
+        break
+      }
+    }
+    let jobStart = -1
+    for (let previous = index; previous >= 0; previous -= 1) {
+      if (/^  [A-Za-z0-9_.-]+:\s*(?:#.*)?$/.test(lines[previous] ?? '')) {
+        jobStart = previous
+        break
+      }
+    }
+    const stepPrefix = lines.slice(stepStart, index + 1)
+    const jobPrefix = jobStart >= 0 ? lines.slice(jobStart, index + 1) : []
+    const disabled = [...stepPrefix, ...jobPrefix].some((candidate) => {
+      const condition = candidate.match(/^\s*(?:-\s*)?if:\s*(.*?)\s*(?:#.*)?$/)?.[1]
+      return condition !== undefined && yamlFalse(condition)
+    })
+    const nonBlocking = stepPrefix.some((candidate) => /^\s*(?:-\s*)?continue-on-error:\s*true\s*(?:#.*)?$/i.test(candidate))
+    let command = runMatch[2] ?? ''
+    if (/^[|>][-+]?\s*$/.test(command)) {
+      const block: string[] = []
+      for (let nested = index + 1; nested < lines.length; nested += 1) {
+        const nestedLine = lines[nested] ?? ''
+        const indent = nestedLine.length - nestedLine.trimStart().length
+        if (nestedLine.trim() && indent <= runIndent) break
+        if (!/^\s*#/.test(nestedLine)) block.push(nestedLine.trim())
+      }
+      command = block.join('\n')
+    }
+    command = command.replace(/^['"]|['"]$/g, '')
+    if (!disabled && command) commands.push({ command, blocking: !nonBlocking })
+  }
+  return commands
+}
+
+function hasBlockingPackageCommand(commands: WorkflowCommand[], name: string): boolean {
+  const pattern = new RegExp(`(?:^|[;&|]\\s*)(?:corepack\\s+)?(?:yarn(?:\\s+run)?|pnpm(?:\\s+run)?|npm(?:\\s+run)?)\\s+${name}\\b`, 'im')
+  return commands.some(({ command, blocking }) => blocking && pattern.test(command))
+}
+
+function hasBlockingMigrationCommand(commands: WorkflowCommand[]): boolean {
+  return commands.some(({ command, blocking }) => blocking && /(?:^|[;&|]\s*)(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)\b/im.test(command))
+}
+
+function requiresNode24OrNewer(range: string): boolean {
+  const clauses = range.split('||').map((clause) => clause.trim()).filter(Boolean)
+  if (!clauses.length) return false
+  return clauses.every((clause) => {
+    const hyphen = clause.match(/^v?(\d+)(?:\.\d+){0,2}\s+-\s+v?\d+/)
+    if (hyphen?.[1]) return Number(hyphen[1]) >= 24
+    const exact = clause.match(/^[~^]?\s*v?(\d+)(?:\.(?:\d+|[x*])){0,2}$/i)
+    if (exact?.[1]) return Number(exact[1]) >= 24
+    const lower = clause.match(/(?:^|\s)(>=|>|\^|~)\s*v?(\d+)(?:\.\d+){0,2}/)
+    if (!lower?.[1] || !lower[2]) return false
+    return Number(lower[2]) >= 24
+  })
 }
 
 export const RULES: readonly RuleDefinition[] = [
@@ -265,8 +426,8 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const source = context.readText('Dockerfile')
       if (!source) return { status: 'skipped', summary: 'No Dockerfile is present.' }
-      const users = [...source.matchAll(/^USER\s+([^\s#]+)/gmi)].map((match) => match[1]?.toLowerCase()).filter(Boolean)
-      return users.length > 0 && users.at(-1) !== 'root' && users.at(-1) !== '0'
+      const user = finalDockerUser(source)
+      return user !== null && user !== 'root' && user !== '0'
         ? { status: 'pass', summary: 'The final container user is non-root.', evidence: ['A final USER directive is present.'] }
         : { status: 'fail', summary: 'The production image does not end with a non-root USER directive.' }
     },
@@ -331,14 +492,14 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const source = context.collectCiText()
       if (!source) return { status: 'warning', summary: 'No recognized in-repository CI workflow was found; verify the external release gate.' }
+      const commands = workflowCommands(source)
       const required = [
-        ['generation', /(?:yarn|npm|pnpm).*\bgenerate\b/i],
-        ['production build', /(?:yarn|npm|pnpm).*\bbuild\b/i],
-        ['tests', /(?:yarn|npm|pnpm).*\btest\b/i],
-        ['migration verification', /migrat/i],
+        ['generation', hasBlockingPackageCommand(commands, 'generate')],
+        ['production build', hasBlockingPackageCommand(commands, 'build')],
+        ['tests', hasBlockingPackageCommand(commands, 'test')],
+        ['migration verification', hasBlockingMigrationCommand(commands)],
       ] as const
-      const missing = required.filter(([, pattern]) => !pattern.test(source)).map(([name]) => name)
-      if (/continue-on-error:\s*true/i.test(source)) return { status: 'fail', summary: 'The CI workflow contains a permissive continue-on-error step that requires review.' }
+      const missing = required.filter(([, present]) => !present).map(([name]) => name)
       return missing.length
         ? { status: 'fail', summary: 'The release validation workflow is incomplete.', evidence: missing.map((name) => `Missing blocking stage: ${name}`) }
         : { status: 'pass', summary: 'CI represents generation, build, tests, and migration verification.' }
@@ -413,7 +574,7 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const engines = context.packageJson.engines
       const node = engines && typeof engines === 'object' && !Array.isArray(engines) ? (engines as Record<string, unknown>).node : undefined
-      return typeof node === 'string' && /(?:>=|\^|~)?\s*2[4-9]/.test(node)
+      return typeof node === 'string' && requiresNode24OrNewer(node)
         ? { status: 'pass', summary: 'package.json requires Node.js 24 or newer.', evidence: ['A supported Node.js engine constraint is declared.'] }
         : { status: 'fail', summary: 'package.json does not require a supported Node.js runtime.' }
     },
@@ -424,8 +585,6 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const inventory = templateInventory(context)
       const risky = [...inventory.booleans].filter(([, enabled]) => enabled).map(([key]) => key)
-      const autologin = [...inventory.names].filter((key) => /AUTOLOGIN/.test(key))
-      risky.push(...autologin.filter((key) => !risky.includes(key)))
       return risky.length === 0
         ? { status: 'warning', summary: 'No development-only switch defaults to enabled in .env.example; verify the live environment separately.' }
         : { status: 'fail', summary: 'Development-only switches default to enabled.', evidence: risky.map((key) => `Enabled template switch: ${key}`) }
