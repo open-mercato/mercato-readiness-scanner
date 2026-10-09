@@ -115,6 +115,12 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     }
     overwrite(root, '.github/workflows/release.yml', 'on:\n  pull_request:\njobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n')
     assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
+    for (const trigger of ['  workflow_dispatch:', '  workflow_call:', '  push:\n    branches: [feature-only]']) {
+      overwrite(root, '.github/workflows/release.yml', `on:\n${trigger}\njobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n`)
+      assert.equal(scan(root).get('release-validation-gate')?.status, 'fail', trigger)
+    }
+    overwrite(root, '.github/workflows/release.yml', "on:\n  push:\n    branches: [main]\njobs:\n  validate:\n    steps:\n      - run: |\n          cat <<'COMMANDS'\n          yarn generate\n          yarn build\n          yarn test\n          yarn db:migrate --check\n          COMMANDS\n")
+    assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
     overwrite(root, '.github/workflows/release.yml', 'on:\n  push:\njobs:\n  build:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n')
     overwrite(root, '.github/workflows/other.yml', 'on:\n  push:\njobs:\n  verify:\n    steps:\n      - run: yarn test\n      - run: yarn db:migrate --check\n')
     assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
@@ -128,11 +134,32 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     manifest.scripts = { build: 'NODE_ENV=production next build', start: 'next dev' }
     fs.writeFileSync(manifestPath, JSON.stringify(manifest))
     assert.equal(scan(root).get('runtime-production-scripts')?.status, 'fail')
+    for (const scripts of [
+      { build: 'NODE_ENV=production next build --help', start: 'next start' },
+      { build: 'NODE_ENV=production next build', start: 'next start --help' },
+    ]) {
+      manifest.scripts = scripts
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest))
+      assert.equal(scan(root).get('runtime-production-scripts')?.status, 'fail')
+    }
+
+    const baselineIgnore = fs.readFileSync(path.join(root, '.gitignore'), 'utf8')
+    overwrite(root, '.gitignore', `${baselineIgnore}\n!.env.production\n!*.pem\n`)
+    assert.equal(scan(root).get('secrets-ignore-policy')?.status, 'fail')
+    overwrite(root, '.gitignore', baselineIgnore)
+    const baselineTemplate = fs.readFileSync(path.join(root, '.env.example'), 'utf8')
+    overwrite(root, '.env.example', baselineTemplate.replace('DATABASE_URL=', 'DATABASE_URL=postgres://operator:live-password@database.internal/app'))
+    assert.equal(scan(root).get('runtime-env-template')?.status, 'fail')
+    overwrite(root, '.env.example', baselineTemplate)
 
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "echo worker"\n')
     assert.equal(scan(root).get('operations-worker-topology')?.status, 'fail')
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "npm worker"\n')
     assert.equal(scan(root).get('operations-worker-topology')?.status, 'fail')
+    for (const command of ['yarn mercato worker || true', 'yarn mercato worker --help']) {
+      overwrite(root, 'railway.worker.toml', `[deploy]\nstartCommand = "${command}"\n`)
+      assert.equal(scan(root).get('operations-worker-topology')?.status, 'fail', command)
+    }
 
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "yarn mercato worker"\n')
     overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    image: app:abcdef1\n  worker:\n    image: worker:fedcba9\n    command: yarn mercato worker\n')
@@ -156,6 +183,10 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     overwrite(root, 'next.config.ts', `export default { async headers() { function decoy() { return [{ source: "/:path*", headers: ${validHeaders} }] } return [] } }\n`)
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
     overwrite(root, 'next.config.ts', `function decoy() { const securityHeaders = ${validHeaders}; return securityHeaders }\nexport default { async headers() { return [{ source: "/:path*", headers: securityHeaders }] } }\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, async headers() { return [] } }\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `let config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; config = { async headers() { return [] } }; export default config\n`)
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
