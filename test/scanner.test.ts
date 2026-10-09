@@ -31,14 +31,16 @@ test('never reads a tracked live environment file or exposes its value', () => {
   const secret = 'SHOULD_NOT_APPEAR_7d51f9'
   try {
     fs.writeFileSync(path.join(root, '.env.production'), `DATABASE_URL=${secret}\n`)
+    fs.writeFileSync(path.join(root, '.env-prod'), `DATABASE_URL=${secret}\n`)
+    fs.writeFileSync(path.join(root, '.envrc'), `export DATABASE_URL=${secret}\n`)
     assert.equal(readSafeText(root, '.env.production'), null)
     assert.equal(readSafeText(root, '.env.local'), null)
-    const added = spawnSync('git', ['add', '--force', '.env.production'], { cwd: root }).status
+    const added = spawnSync('git', ['add', '--force', '.env.production', '.env-prod', '.envrc'], { cwd: root }).status
     assert.equal(added, 0)
     const report = scan(root)
     const finding = report.results.find((result) => result.id === 'secrets-live-env-untracked')
     assert.equal(finding?.status, 'fail')
-    assert.deepEqual(finding?.evidence, ['Tracked sensitive path: .env.production'])
+    assert.deepEqual(finding?.evidence, ['Tracked sensitive path: .env-prod', 'Tracked sensitive path: .env.production', 'Tracked sensitive path: .envrc'])
     assert.equal(JSON.stringify(report).includes(secret), false)
   } finally {
     removeFixture(root)
@@ -50,12 +52,17 @@ test('detects credential-like tracked paths without opening their contents', () 
   const secret = 'PRIVATE_MATERIAL_SHOULD_NOT_APPEAR_186b0e'
   try {
     fs.writeFileSync(path.join(root, 'deployment.pem'), secret)
+    fs.writeFileSync(path.join(root, 'id_ecdsa'), secret)
+    fs.mkdirSync(path.join(root, '.aws'), { recursive: true })
+    fs.writeFileSync(path.join(root, '.aws', 'credentials'), secret)
     assert.equal(readSafeText(root, 'deployment.pem'), null)
-    assert.equal(spawnSync('git', ['add', '--force', 'deployment.pem'], { cwd: root }).status, 0)
+    assert.equal(readSafeText(root, 'id_ecdsa'), null)
+    assert.equal(readSafeText(root, '.aws/credentials'), null)
+    assert.equal(spawnSync('git', ['add', '--force', 'deployment.pem', 'id_ecdsa', '.aws/credentials'], { cwd: root }).status, 0)
     const report = scan(root)
     const finding = report.results.find((result) => result.id === 'secrets-no-tracked-credentials')
     assert.equal(finding?.status, 'fail')
-    assert.deepEqual(finding?.evidence, ['Tracked sensitive path: deployment.pem'])
+    assert.deepEqual(finding?.evidence, ['Tracked sensitive path: .aws/credentials', 'Tracked sensitive path: deployment.pem', 'Tracked sensitive path: id_ecdsa'])
     assert.equal(JSON.stringify(report).includes(secret), false)
   } finally {
     removeFixture(root)

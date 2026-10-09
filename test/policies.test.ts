@@ -57,8 +57,30 @@ test('accepts only explicit loopback Compose bindings for recognized stateful se
       '      - host_ip: "::1"',
       '        published: 5432',
       '        target: 5432',
+      '  cache:',
+      '    image: redis:7',
+      '    ports: ["[0:0:0:0:0:0:0:1]:6379:6379"]',
     ].join('\n'))
     assert.equal(status(root, 'infrastructure-private-services'), 'pass')
+  } finally {
+    removeFixture(root)
+  }
+})
+
+test('evaluates effective Compose merges and host networking', () => {
+  const root = makeAppFixture()
+  try {
+    overwrite(root, 'docker-compose.fullapp.yml', [
+      'x-database: &database',
+      '  image: postgres:17',
+      '  ports: ["5432:5432"]',
+      'services:',
+      '  database:',
+      '    <<: *database',
+    ].join('\n'))
+    assert.equal(status(root, 'infrastructure-private-services'), 'fail')
+    overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  redis:\n    image: redis:7\n    network_mode: host\n')
+    assert.equal(status(root, 'infrastructure-private-services'), 'fail')
   } finally {
     removeFixture(root)
   }
@@ -75,6 +97,8 @@ test('requires a non-root USER in the final Docker stage', () => {
     assert.equal(status(root, 'container-non-root-user'), 'fail')
     overwrite(root, 'Dockerfile', 'FROM node:24 AS build\nUSER root\nFROM node:24\nUSER app\n')
     assert.equal(status(root, 'container-non-root-user'), 'pass')
+    overwrite(root, 'Dockerfile', 'FROM node:24 AS secure\nUSER 1001:1001\nFROM secure AS runtime\n')
+    assert.equal(status(root, 'container-non-root-user'), 'pass')
   } finally {
     removeFixture(root)
   }
@@ -89,6 +113,29 @@ test('counts only active blocking workflow commands as release validation', () =
       '    steps:',
       '      # yarn generate && yarn build && yarn test && yarn db:migrate',
       '      - run: echo no-op',
+    ].join('\n'))
+    assert.equal(status(root, 'release-validation-gate'), 'fail')
+
+    overwrite(root, '.github/workflows/release.yml', [
+      'jobs:',
+      '  validate:',
+      '    steps:',
+      '      - run: yarn generate',
+      '      - run: yarn build',
+      '      - run: yarn test || true',
+      '      - run: yarn db:migrate --check',
+    ].join('\n'))
+    assert.equal(status(root, 'release-validation-gate'), 'fail')
+
+    overwrite(root, '.github/workflows/release.yml', [
+      'jobs:',
+      '  validate:',
+      '    steps:',
+      '      - run: yarn generate',
+      '      - run: yarn build',
+      '      - run: yarn test',
+      '      - run: yarn db:migrate --check',
+      '        continue-on-error: ${{ matrix.nonblocking }}',
     ].join('\n'))
     assert.equal(status(root, 'release-validation-gate'), 'fail')
 
@@ -165,8 +212,34 @@ test('treats only explicitly enabled development switches as unsafe defaults', (
     assert.equal(status(root, 'runtime-debug-features-disabled'), 'warning')
     fs.appendFileSync(path.join(root, '.env.example'), 'DEBUG_MODE="false"\nPROFILE_MODE=\'false\'\n')
     assert.equal(status(root, 'runtime-debug-features-disabled'), 'warning')
-    fs.appendFileSync(path.join(root, '.env.example'), 'AUTOLOGIN_ENABLED="true"\n')
-    assert.equal(status(root, 'runtime-debug-features-disabled'), 'fail')
+    const template = fs.readFileSync(path.join(root, '.env.example'), 'utf8')
+    for (const enabled of ['QUERY_ENGINE_DEBUG_SQL=" true "', 'DEMO_MODE=enabled', 'PROFILE_MODE=y']) {
+      fs.writeFileSync(path.join(root, '.env.example'), `${template}\n${enabled}\n`)
+      assert.equal(status(root, 'runtime-debug-features-disabled'), 'fail', enabled)
+    }
+  } finally {
+    removeFixture(root)
+  }
+})
+
+test('requires effective worker and command evidence instead of comments or empty files', () => {
+  const root = makeAppFixture()
+  try {
+    overwrite(root, 'railway.worker.toml', '')
+    overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    image: app:abcdef1\n')
+    assert.equal(status(root, 'operations-worker-topology'), 'fail')
+    assert.equal(status(root, 'workers-release-parity'), 'skipped')
+
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as { scripts: Record<string, string> }
+    manifest.scripts.build = 'echo NODE_ENV=production && next build'
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify(manifest))
+    assert.equal(status(root, 'runtime-production-scripts'), 'fail')
+
+    overwrite(root, 'next.config.ts', 'const active = true // Content-Security-Policy Referrer-Policy X-Content-Type-Options X-Frame-Options\nexport default { active }\n')
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+
+    overwrite(root, 'Dockerfile', 'FROM node:24\nRUN echo preparing # npm ci\nRUN npm install\nUSER app\n')
+    assert.equal(status(root, 'supply-chain-immutable-install'), 'fail')
   } finally {
     removeFixture(root)
   }

@@ -1,7 +1,8 @@
+import { isIP } from 'node:net'
 import { parseEnv } from 'node:util'
 import { minVersion, validRange } from 'semver'
 import { parse, parseAllDocuments } from 'yaml'
-import { isLiveEnvPath } from './files.js'
+import { isCredentialPath, isLiveEnvPath } from './files.js'
 import type { RuleCheck, RuleDefinition, ScanContext, Severity } from './types.js'
 
 const DOCS_BASE = 'https://github.com/open-mercato/mercato-readiness-scanner/blob/main/docs/rules'
@@ -56,12 +57,13 @@ function templateInventory(context: ScanContext): TemplateInventory {
   for (const [key, rawValue] of Object.entries(values)) {
     if (!/^[A-Z][A-Z0-9_]*$/.test(key) || rawValue === undefined) continue
     names.add(key)
+    const normalizedValue = rawValue.trim()
     if (/(?:DEBUG|PROFILE|DEVTOOLS|AUTOLOGIN|TEST_INJECT|DEMO_MODE|EMERGENCY_BYPASS|INTEGRATION_TEST|AUTO_SPAWN_WORKERS)/.test(key)) {
-      if (/^(?:1|true|yes|on)$/i.test(rawValue)) booleans.set(key, true)
-      if (/^(?:0|false|no|off)$/i.test(rawValue)) booleans.set(key, false)
+      if (/^(?:1|true|yes|y|on|enabled)$/i.test(normalizedValue)) booleans.set(key, true)
+      if (/^(?:0|false|no|n|off|disabled)$/i.test(normalizedValue)) booleans.set(key, false)
     }
-    if (key === 'RATE_LIMIT_TRUST_PROXY_DEPTH' && /^-?\d+$/.test(rawValue)) integers.set(key, Number(rawValue))
-    if (key === 'CACHE_STRATEGY' && /^(?:redis|memory|sqlite)$/i.test(rawValue)) enums.set(key, rawValue.toLowerCase())
+    if (key === 'RATE_LIMIT_TRUST_PROXY_DEPTH' && /^-?\d+$/.test(normalizedValue)) integers.set(key, Number(normalizedValue))
+    if (key === 'CACHE_STRATEGY' && /^(?:redis|memory|sqlite)$/i.test(normalizedValue)) enums.set(key, normalizedValue.toLowerCase())
   }
   return { names, booleans, integers, enums }
 }
@@ -83,25 +85,33 @@ function ignorePatterns(context: ScanContext): ReadonlySet<string> {
   return new Set(source.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#')))
 }
 
-function trackedCredentialPath(relativePath: string): boolean {
-  const normalized = relativePath.replaceAll('\\', '/')
-  const basename = normalized.split('/').at(-1)?.toLowerCase() ?? ''
-  return /\.(?:pem|key|p12|pfx|jks)$/i.test(basename)
-    || ['id_rsa', 'id_ed25519', '.mcp.json', '.npmrc'].includes(basename)
-    || /(?:^|\/)\.(?:codex|cursor)\/mcp\.json$/i.test(normalized)
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
 function isLoopbackBinding(value: string): boolean {
   const normalized = value.replace(/^['"]|['"]$/g, '').trim()
-  return /^(?:127(?:\.\d{1,3}){3}|localhost):/i.test(normalized) || /^\[::1\]:/.test(normalized)
+  if (normalized.startsWith('[')) {
+    const closing = normalized.indexOf(']')
+    return closing > 0 && normalized[closing + 1] === ':' && isLoopbackHost(normalized.slice(1, closing))
+  }
+  const separator = normalized.indexOf(':')
+  return separator > 0 && isLoopbackHost(normalized.slice(0, separator))
 }
 
 function isLoopbackHost(value: unknown): boolean {
-  return typeof value === 'string' && /^(?:127(?:\.\d{1,3}){3}|localhost|::1)$/i.test(value.trim())
+  if (typeof value !== 'string') return false
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'localhost') return true
+  if (isIP(normalized) === 4) return normalized.startsWith('127.')
+  if (isIP(normalized) !== 6) return false
+  const halves = normalized.split('::')
+  if (halves.length > 2) return false
+  const left = halves[0] ? halves[0].split(':') : []
+  const right = halves[1] ? halves[1].split(':') : []
+  const missing = halves.length === 2 ? 8 - left.length - right.length : 0
+  const groups = [...left, ...Array.from({ length: missing }, () => '0'), ...right]
+  return groups.length === 8 && groups.slice(0, 7).every((group) => Number.parseInt(group || '0', 16) === 0) && Number.parseInt(groups[7] ?? '0', 16) === 1
 }
 
 function composePublicBindings(context: ScanContext): string[] {
@@ -111,7 +121,7 @@ function composePublicBindings(context: ScanContext): string[] {
     if (!source) continue
     let root: unknown
     try {
-      root = parse(source)
+      root = parse(source, { merge: true })
     } catch {
       findings.push(`${file}: Compose configuration could not be safely parsed`)
       continue
@@ -124,6 +134,7 @@ function composePublicBindings(context: ScanContext): string[] {
       if (!isRecord(value)) continue
       const image = typeof value.image === 'string' ? value.image : ''
       if (!/(?:postgres|redis|search|opensearch|elastic|meili)/i.test(`${name}\n${image}`)) continue
+      if (value.network_mode === 'host') findings.push(`${file}: ${name} uses host networking`)
       if (value.ports === undefined) continue
       if (!Array.isArray(value.ports)) {
         findings.push(`${file}: ${name} uses unsupported ports syntax`)
@@ -144,11 +155,90 @@ function composePublicBindings(context: ScanContext): string[] {
   return findings
 }
 
+function uncommented(source: string): string {
+  let output = ''
+  let quote = ''
+  let escaped = false
+  let blockComment = false
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index] ?? ''
+    const next = source[index + 1] ?? ''
+    if (blockComment) {
+      if (character === '*' && next === '/') {
+        blockComment = false
+        index += 1
+      } else if (character === '\n') output += '\n'
+      continue
+    }
+    if (quote) {
+      output += character
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === quote) quote = ''
+      continue
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character
+      output += character
+      continue
+    }
+    if (character === '/' && next === '*') {
+      blockComment = true
+      index += 1
+      continue
+    }
+    if (character === '/' && next === '/') {
+      while (index < source.length && source[index] !== '\n') index += 1
+      output += '\n'
+      continue
+    }
+    if (character === '#' && (index === 0 || /\s/.test(source[index - 1] ?? ''))) {
+      while (index < source.length && source[index] !== '\n') index += 1
+      output += '\n'
+      continue
+    }
+    output += character
+  }
+  return output
+}
+
+function executableDeploymentText(context: ScanContext): string {
+  return ['Dockerfile', 'railway.toml', 'railway.worker.toml', 'scripts/railway-start.sh', 'scripts/railway-worker.sh', 'docker/scripts/init-or-migrate.sh']
+    .map((file) => uncommented(context.readText(file) ?? ''))
+    .join('\n')
+}
+
+function workerDefinitions(context: ScanContext): string[] {
+  const paths: string[] = []
+  const railway = context.readText('railway.worker.toml')
+  if (railway && /(?:startCommand\s*=|command\s*=)[^\n]*\bworker\b/i.test(uncommented(railway))) paths.push('railway.worker.toml')
+  const script = context.readText('scripts/railway-worker.sh')
+  if (script && /\bworker\b/i.test(uncommented(script))) paths.push('scripts/railway-worker.sh')
+  const compose = context.readText('docker-compose.fullapp.yml')
+  if (compose) {
+    try {
+      const root: unknown = parse(compose, { merge: true })
+      if (isRecord(root) && isRecord(root.services)) {
+        const worker = Object.entries(root.services).some(([name, value]) => {
+          if (!isRecord(value)) return false
+          const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
+          return /worker/i.test(`${name}\n${command}`)
+        })
+        if (worker) paths.push('docker-compose.fullapp.yml')
+      }
+    } catch {
+      return paths
+    }
+  }
+  return paths
+}
+
 function workerDockerfiles(context: ScanContext): string[] {
+  if (!workerDefinitions(context).includes('railway.worker.toml')) return []
   const values: string[] = []
   for (const file of ['railway.toml', 'railway.worker.toml']) {
     const source = context.readText(file)
-    if (!source) continue
+    if (!source?.trim()) continue
     const configured = source.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1]
     values.push(configured ? displayPath(configured) : 'Dockerfile')
   }
@@ -157,17 +247,23 @@ function workerDockerfiles(context: ScanContext): string[] {
 
 function finalDockerUser(source: string): string | null {
   const lines = source.split(/\r?\n/)
-  let finalStageStart = -1
-  for (let index = 0; index < lines.length; index += 1) {
-    if (/^\s*FROM\s+/i.test(lines[index] ?? '')) finalStageStart = index
+  const stages = new Map<string, { user: string | null }>()
+  let current: { user: string | null } | null = null
+  let stageIndex = 0
+  for (const line of lines) {
+    const from = line.match(/^\s*FROM\s+(?:--platform=\S+\s+)?([^\s]+)(?:\s+AS\s+([^\s#]+))?/i)
+    if (from?.[1]) {
+      const inherited = stages.get(from[1].toLowerCase())?.user ?? null
+      current = { user: inherited }
+      stages.set(String(stageIndex), current)
+      if (from[2]) stages.set(from[2].toLowerCase(), current)
+      stageIndex += 1
+      continue
+    }
+    const user = line.match(/^\s*USER\s+([^\s#]+)/i)?.[1]
+    if (current && user) current.user = user.toLowerCase()
   }
-  if (finalStageStart < 0) return null
-  let user: string | null = null
-  for (const line of lines.slice(finalStageStart + 1)) {
-    const match = line.match(/^\s*USER\s+([^\s#]+)/i)
-    if (match?.[1]) user = match[1].toLowerCase()
-  }
-  return user
+  return current?.user ?? null
 }
 
 type WorkflowCommand = { command: string, blocking: boolean }
@@ -179,6 +275,14 @@ function constantBoolean(value: unknown, expected: boolean): boolean {
   return new RegExp(`^(?:${token}|\\$\\{\\{\\s*${token}\\s*\\}\\})$`, 'i').test(value.trim())
 }
 
+function alwaysRuns(value: unknown): boolean {
+  return value === undefined || constantBoolean(value, true)
+}
+
+function failureIsBlocking(value: unknown): boolean {
+  return value === undefined || constantBoolean(value, false)
+}
+
 function workflowCommands(source: string): WorkflowCommand[] {
   const commands: WorkflowCommand[] = []
   for (const document of parseAllDocuments(source)) {
@@ -187,13 +291,13 @@ function workflowCommands(source: string): WorkflowCommand[] {
     if (!isRecord(root) || !isRecord(root.jobs)) continue
     for (const value of Object.values(root.jobs)) {
       if (!isRecord(value) || !Array.isArray(value.steps)) continue
-      const jobDisabled = constantBoolean(value.if, false)
-      const jobNonBlocking = constantBoolean(value['continue-on-error'], true)
+      const jobRuns = alwaysRuns(value.if)
+      const jobBlocking = failureIsBlocking(value['continue-on-error'])
       for (const step of value.steps) {
         if (!isRecord(step) || typeof step.run !== 'string') continue
-        const disabled = jobDisabled || constantBoolean(step.if, false)
-        const nonBlocking = jobNonBlocking || constantBoolean(step['continue-on-error'], true)
-        if (!disabled && step.run.trim()) commands.push({ command: step.run, blocking: !nonBlocking })
+        const runs = jobRuns && alwaysRuns(step.if)
+        const blocking = jobBlocking && failureIsBlocking(step['continue-on-error'])
+        if (runs && step.run.trim()) commands.push({ command: step.run, blocking })
       }
     }
   }
@@ -202,11 +306,15 @@ function workflowCommands(source: string): WorkflowCommand[] {
 
 function hasBlockingPackageCommand(commands: WorkflowCommand[], name: string): boolean {
   const pattern = new RegExp(`(?:^|[;&|]\\s*)(?:corepack\\s+)?(?:yarn(?:\\s+run)?|pnpm(?:\\s+run)?|npm(?:\\s+run)?)\\s+${name}\\b`, 'im')
-  return commands.some(({ command, blocking }) => blocking && pattern.test(command))
+  return commands.some(({ command, blocking }) => blocking && commandPreservesFailure(command) && pattern.test(command))
 }
 
 function hasBlockingMigrationCommand(commands: WorkflowCommand[]): boolean {
-  return commands.some(({ command, blocking }) => blocking && /(?:^|[;&|]\s*)(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)\b/im.test(command))
+  return commands.some(({ command, blocking }) => blocking && commandPreservesFailure(command) && /(?:^|[;&|]\s*)(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)\b/im.test(command))
+}
+
+function commandPreservesFailure(command: string): boolean {
+  return !/\|\||\bset\s+\+e\b|;\s*exit\s+0\b/i.test(command)
 }
 
 function requiresNode24OrNewer(range: string): boolean {
@@ -233,7 +341,7 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Remove tracked credential or private-key files, revoke or rotate the material, and store it in an access-controlled secret manager.',
     check: (context) => {
       if (!context.trackedFiles) return { status: 'warning', summary: 'Git tracking could not be inspected; verify that no credential or private-key file is committed.' }
-      const tracked = [...context.trackedFiles].filter(trackedCredentialPath)
+      const tracked = [...context.trackedFiles].filter(isCredentialPath)
       return tracked.length
         ? { status: 'fail', summary: 'Credential-like or private-key paths are tracked.', evidence: tracked.map((file) => `Tracked sensitive path: ${displayPath(file)}`) }
         : { status: 'pass', summary: 'No recognized credential or private-key path is tracked.' }
@@ -271,7 +379,9 @@ export const RULES: readonly RuleDefinition[] = [
       const values = scripts(context)
       const missing = ['build', 'start'].filter((name) => !values[name])
       if (missing.length) return { status: 'fail', summary: 'Production lifecycle scripts are incomplete.', evidence: missing.map((name) => `Missing package script: ${name}`) }
-      if (!/NODE_ENV=production/.test(values.build ?? '')) return { status: 'fail', summary: 'The build script does not explicitly force NODE_ENV=production.' }
+      const build = values.build ?? ''
+      const productionBuild = /(?:^|&&|;)\s*(?:cross-env\s+)?NODE_ENV=production\s+(?:(?:next|mercato)\s+build|(?:yarn|pnpm|npm(?:\s+run)?)\s+build(?::[A-Za-z0-9_-]+)?)(?:\s|$)/i.test(build)
+      if (!productionBuild) return { status: 'fail', summary: 'The build script does not explicitly force NODE_ENV=production for the build command.' }
       return { status: 'pass', summary: 'Production build and start scripts are present and production mode is explicit.' }
     },
   }),
@@ -316,7 +426,7 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'edge-security-headers', title: 'Application security headers are configured', category: 'Edge', severity: 'high',
     remediation: 'Keep the shared CSP and security headers in next.config.ts and verify that the public edge preserves them.',
     check: (context) => {
-      const source = context.readText('next.config.ts') ?? context.readText('next.config.mjs') ?? ''
+      const source = uncommented(context.readText('next.config.ts') ?? context.readText('next.config.mjs') ?? '')
       const required = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options']
       const missing = required.filter((header) => !source.includes(header))
       if (!/X-Frame-Options|frame-ancestors/.test(source)) missing.push('frame protection')
@@ -365,7 +475,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'supply-chain-immutable-install', title: 'Deployments use immutable dependency installation', category: 'Supply chain', severity: 'high',
     remediation: 'Commit one lockfile and use an immutable/frozen install in image and CI builds.',
-    check: (context) => /yarn\s+install\s+--immutable|npm\s+ci\b|pnpm\s+install\s+--frozen-lockfile/i.test(context.collectDeploymentText())
+    check: (context) => /(?:^|&&|;|\bRUN\s+)(?:corepack\s+)?(?:yarn\s+install\s+--immutable|npm\s+ci\b|pnpm\s+install\s+--frozen-lockfile)/im.test(executableDeploymentText(context))
       ? { status: 'pass', summary: 'Deployment configuration uses an immutable dependency install.' }
       : { status: 'fail', summary: 'No immutable dependency installation was found in deployment configuration.' },
   }),
@@ -383,7 +493,7 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'infrastructure-shared-redis', title: 'Multi-process deployments use shared Redis coordination', category: 'Infrastructure', severity: 'high',
     remediation: 'Use shared Redis-backed cache, events, and asynchronous queues whenever web and worker processes run separately.',
     check: (context) => {
-      const hasWorker = ['railway.worker.toml', 'scripts/railway-worker.sh'].some(context.exists)
+      const hasWorker = workerDefinitions(context).length > 0
       if (!hasWorker) return { status: 'skipped', summary: 'No separate worker process was detected.' }
       const inventory = templateInventory(context)
       const strategy = inventory.enums.get('CACHE_STRATEGY')
@@ -396,7 +506,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'release-database-migrations', title: 'Database migrations are part of release startup', category: 'Release', severity: 'high',
     remediation: 'Run the supported database migration command once per release before accepting traffic.',
-    check: (context) => /(?:db[: ]migrate|mercato\s+db\s+migrate)/i.test(context.collectDeploymentText())
+    check: (context) => /(?:db[: ]migrate|mercato\s+db\s+migrate)/i.test(executableDeploymentText(context))
       ? { status: 'warning', summary: 'A migration path exists; verify exactly one controlled release job can execute it.' }
       : { status: 'fail', summary: 'No database migration step was found in deployment configuration.' },
   }),
@@ -440,7 +550,7 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Deploy the supported worker process separately, keep its release aligned with the web app, and monitor both.',
     check: (context) => {
       if (!dependencies(context).has('@open-mercato/queue')) return { status: 'skipped', summary: 'The queue package is not installed.' }
-      const paths = ['railway.worker.toml', 'scripts/railway-worker.sh', 'docker-compose.fullapp.yml'].filter(context.exists)
+      const paths = workerDefinitions(context)
       return paths.length
         ? { status: 'pass', summary: 'An explicit worker deployment surface is present.', evidence: fileEvidence(paths) }
         : { status: 'fail', summary: 'The queue package is installed but no worker deployment surface was found.' }
@@ -450,7 +560,7 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'workers-release-parity', title: 'Web and worker processes use the same release artifact', category: 'Operations', severity: 'high',
     remediation: 'Deploy one immutable build to web and worker roles and vary only the supported entrypoint.',
     check: (context) => {
-      if (!context.exists('railway.worker.toml') && !context.exists('scripts/railway-worker.sh')) return { status: 'skipped', summary: 'No separate worker process was detected.' }
+      if (workerDefinitions(context).length === 0) return { status: 'skipped', summary: 'No separate worker process was detected.' }
       const dockerfiles = workerDockerfiles(context)
       if (dockerfiles.length < 2) return { status: 'warning', summary: 'Worker deployment exists, but artifact parity is controlled outside recognized repository files.' }
       return new Set(dockerfiles).size === 1

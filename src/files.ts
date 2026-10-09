@@ -39,17 +39,19 @@ function resolvesWithinRoot(root: string, absolute: string): boolean {
   }
 }
 
-function isForbiddenEnv(relativePath: string): boolean {
+export function isLiveEnvPath(relativePath: string): boolean {
   const basename = path.posix.basename(normalized(relativePath)).toLowerCase()
-  return (basename === '.env' || basename.startsWith('.env.')) && !SAFE_ENV_TEMPLATES.has(basename)
+  return basename.startsWith('.env') && !SAFE_ENV_TEMPLATES.has(basename)
 }
 
-function isForbiddenCredential(relativePath: string): boolean {
+export function isCredentialPath(relativePath: string): boolean {
   const normalizedPath = normalized(relativePath)
   const basename = path.posix.basename(normalizedPath).toLowerCase()
   return /\.(?:pem|key|p12|pfx|jks)$/i.test(basename)
-    || ['id_rsa', 'id_ed25519', '.mcp.json', '.npmrc'].includes(basename)
+    || ['id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519', 'id_xmss', '.mcp.json', '.npmrc'].includes(basename)
     || /(?:^|\/)\.(?:codex|cursor)\/mcp\.json$/i.test(normalizedPath)
+    || /(?:^|\/)\.aws\/credentials$/i.test(normalizedPath)
+    || /(?:^|\/)\.config\/gcloud\/application_default_credentials\.json$/i.test(normalizedPath)
 }
 
 export function existsInside(root: string, relativePath: string): boolean {
@@ -64,7 +66,7 @@ export function existsInside(root: string, relativePath: string): boolean {
 }
 
 export function readSafeText(root: string, relativePath: string): string | null {
-  if (isForbiddenEnv(relativePath) || isForbiddenCredential(relativePath)) return null
+  if (isLiveEnvPath(relativePath) || isCredentialPath(relativePath)) return null
   const absolute = resolveInside(root, relativePath)
   if (!absolute) return null
   try {
@@ -128,10 +130,4 @@ export function collectDeploymentText(root: string): string {
 export function collectCiText(root: string): string {
   const files = collectTextFiles(root, '.github/workflows', /\.(?:yml|yaml)$/i)
   return files.map((file) => readSafeText(root, file)).filter((value): value is string => value !== null).join('\n---\n')
-}
-
-export function isLiveEnvPath(relativePath: string): boolean {
-  const normalizedPath = normalized(relativePath)
-  const basename = path.posix.basename(normalizedPath).toLowerCase()
-  return (basename === '.env' || basename.startsWith('.env.')) && !SAFE_ENV_TEMPLATES.has(basename)
 }
