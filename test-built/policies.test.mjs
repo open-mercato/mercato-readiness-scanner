@@ -19,7 +19,7 @@ function fixture(files = {}) {
     }),
     'src/modules.ts': 'export default []\n',
     '.env.example': 'NODE_ENV=production\nAPP_URL=https://example.com\nDATABASE_URL=\nINTERNAL_APP_ORIGIN=\nPLATFORM_PRIMARY_HOST=\nRATE_LIMIT_TRUST_PROXY_DEPTH=1\nAPP_ALLOWED_ORIGINS=https://example.com\nCACHE_STRATEGY=redis\nREDIS_URL=\n',
-    '.gitignore': '.env\n.env.production\n.env.local\n.env.*.local\n!.env.example\n*.pem\n*.key\n.mcp.json\n.npmrc\n.ai/session-exports/\n',
+    '.gitignore': '.env\n.env*\n.env.production\n.env.local\n.env.*.local\n!.env.example\n*.pem\n*.key\n.mcp.json\n.npmrc\n.ai/session-exports/\n',
     'yarn.lock': '# lock\n',
     Dockerfile: 'FROM node:24\nRUN yarn install --immutable\nUSER app\n',
     'next.config.ts': 'const securityHeaders = [\n  { key: "Content-Security-Policy", value: "default-src self; frame-ancestors self" },\n  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },\n  { key: "X-Content-Type-Options", value: "nosniff" },\n  { key: "X-Frame-Options", value: "SAMEORIGIN" },\n]\nexport default { async headers() { return [{ source: "/:path*", headers: securityHeaders }] } }\n',
@@ -115,7 +115,7 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     }
     overwrite(root, '.github/workflows/release.yml', 'on:\n  pull_request:\njobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n')
     assert.equal(scan(root).get('release-validation-gate')?.status, 'fail')
-    for (const trigger of ['  workflow_dispatch:', '  workflow_call:', '  push:\n    branches: [feature-only]', '  push:\n    branches: [feature/**]', '  push:\n    branches-ignore: [main, master, develop]', '  push:\n    branches-ignore: [ma*]']) {
+    for (const trigger of ['  workflow_dispatch:', '  workflow_call:', '  push:\n    branches: [feature-only]', '  push:\n    branches: [feature/**]', '  push:\n    tags: [feature-*]', '  release:\n    types: [deleted]', '  push:\n    branches: [main]\n    paths-ignore: ["**"]', '  push:\n    branches-ignore: [main, master, develop]', '  push:\n    branches-ignore: [ma*]']) {
       overwrite(root, '.github/workflows/release.yml', `on:\n${trigger}\njobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n`)
       assert.equal(scan(root).get('release-validation-gate')?.status, 'fail', trigger)
     }
@@ -139,6 +139,8 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
       { build: 'NODE_ENV=production next build', start: 'next start --help' },
       { build: 'NODE_ENV=production next build --help=true', start: 'next start' },
       { build: 'NODE_ENV=production next build', start: 'next start --version=true' },
+      { build: 'NODE_ENV=production next build -h=true', start: 'next start' },
+      { build: 'NODE_ENV=production next build', start: 'next start -v=true' },
     ]) {
       manifest.scripts = scripts
       fs.writeFileSync(manifestPath, JSON.stringify(manifest))
@@ -146,7 +148,7 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     }
 
     const baselineIgnore = fs.readFileSync(path.join(root, '.gitignore'), 'utf8')
-    overwrite(root, '.gitignore', `${baselineIgnore}\n!.env.production\n!*.pem\n!.env.[p]roduction\n`)
+    overwrite(root, '.gitignore', `${baselineIgnore}\n!.env.production\n!*.pem\n!.env.[p]roduction\n!/.env.staging\n`)
     assert.equal(scan(root).get('secrets-ignore-policy')?.status, 'fail')
     overwrite(root, '.gitignore', baselineIgnore)
     const baselineTemplate = fs.readFileSync(path.join(root, '.env.example'), 'utf8')
@@ -156,6 +158,10 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     assert.equal(scan(root).get('runtime-env-template')?.status, 'fail')
     overwrite(root, '.env.example', baselineTemplate.replace('DATABASE_URL=', 'DATABASE_URL="postgres://example.com/app#token=percent%2Dencoded%2Dsecret"'))
     assert.equal(scan(root).get('runtime-env-template')?.status, 'fail')
+    for (const value of ['postgres://example.com/app?sslpassword=live-secret', 'postgres://example.com/app?apiKey=live-secret', 'postgres://example.com/app?pwd=live-secret', 'postgres://example.com/app#opaque-live-secret']) {
+      overwrite(root, '.env.example', baselineTemplate.replace('DATABASE_URL=', `DATABASE_URL="${value}"`))
+      assert.equal(scan(root).get('runtime-env-template')?.status, 'fail', value)
+    }
     overwrite(root, '.env.example', baselineTemplate)
 
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "echo worker"\n')
@@ -176,6 +182,13 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     overwrite(root, 'railway.toml', '[deploy]\nstartCommand = "echo /api/healthz && echo yarn db:migrate"\n')
     assert.equal(scan(root).get('operations-health-check')?.status, 'fail')
     assert.equal(scan(root).get('release-database-migrations')?.status, 'fail')
+    overwrite(root, 'railway.toml', '[build]\nhealthcheckPath = "/api/healthz"\nstartCommand = "yarn db:migrate"\n[deploy]\nstartCommand = "false && yarn db:migrate"\n')
+    assert.equal(scan(root).get('operations-health-check')?.status, 'fail')
+    assert.equal(scan(root).get('release-database-migrations')?.status, 'fail')
+    for (const healthcheck of ['healthcheck:\n      disable: true\n      test: ["CMD", "curl", "http://localhost:3000/api/healthz"]', 'healthcheck:\n      test: ["CMD-SHELL", "echo curl http://localhost:3000/api/healthz"]', 'healthcheck:\n      test: ["CMD-SHELL", "curl http://localhost:3000/api/healthz || true"]']) {
+      overwrite(root, 'docker-compose.fullapp.yml', `services:\n  app:\n    ${healthcheck}\n`)
+      assert.equal(scan(root).get('operations-health-check')?.status, 'fail', healthcheck)
+    }
 
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "yarn mercato worker"\n')
     overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    image: app:abcdef1\n  worker:\n    image: worker:fedcba9\n    command: yarn mercato worker\n')
@@ -194,6 +207,8 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     overwrite(root, 'next.config.ts', 'const securityHeaders = [{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }]\nexport default { async headers() { const securityHeaders = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options"]; return [{ source: "/:path*", headers: securityHeaders }] } }\n')
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
     const validHeaders = '[{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }]'
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'pass')
     overwrite(root, 'next.config.ts', `const decoy = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }\nexport default { async headers() { return [] } }\n`)
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
     overwrite(root, 'next.config.ts', `export default { async headers() { function decoy() { return [{ source: "/:path*", headers: ${validHeaders} }] } return [] } }\n`)
@@ -209,6 +224,12 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, headers: async () => [] }\n`)
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
     overwrite(root, 'next.config.ts', `const headers = undefined; export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, headers }\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, "headers": undefined }\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, ["headers"]: undefined }\n`)
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: [{ key: "Content-Security-Policy", value: undefined }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }] }] }\n`)
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')

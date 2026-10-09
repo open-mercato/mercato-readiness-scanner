@@ -38,6 +38,7 @@ const FILES: Record<string, string> = {
   ].join('\n'),
   '.gitignore': [
     '.env',
+    '.env*',
     '.env.production',
     '.env.local',
     '.env.*.local',

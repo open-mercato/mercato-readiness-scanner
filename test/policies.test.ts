@@ -254,6 +254,9 @@ test('counts only active blocking workflow commands as release validation', () =
       ['  workflow_call:'],
       ['  push:', '    branches: [feature-only]'],
       ['  push:', '    branches: [feature/**]'],
+      ['  push:', '    tags: [feature-*]'],
+      ['  release:', '    types: [deleted]'],
+      ['  push:', '    branches: [main]', '    paths-ignore: ["**"]'],
       ['  push:', '    branches-ignore: [main, master, develop]'],
       ['  push:', '    branches-ignore: [ma*]'],
     ]) {
@@ -368,6 +371,8 @@ test('requires effective worker and command evidence instead of comments or empt
       { build: 'NODE_ENV=production next build', start: 'next start --help' },
       { build: 'NODE_ENV=production next build --help=true', start: 'next start' },
       { build: 'NODE_ENV=production next build', start: 'next start --version=true' },
+      { build: 'NODE_ENV=production next build -h=true', start: 'next start' },
+      { build: 'NODE_ENV=production next build', start: 'next start -v=true' },
     ]) {
       manifest.scripts = scripts
       fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify(manifest))
@@ -375,7 +380,7 @@ test('requires effective worker and command evidence instead of comments or empt
     }
 
     const baselineIgnore = fs.readFileSync(path.join(root, '.gitignore'), 'utf8')
-    overwrite(root, '.gitignore', `${baselineIgnore}\n!.env.production\n!*.pem\n!.env.[p]roduction\n`)
+    overwrite(root, '.gitignore', `${baselineIgnore}\n!.env.production\n!*.pem\n!.env.[p]roduction\n!/.env.staging\n`)
     assert.equal(status(root, 'secrets-ignore-policy'), 'fail')
     overwrite(root, '.gitignore', baselineIgnore)
 
@@ -386,6 +391,15 @@ test('requires effective worker and command evidence instead of comments or empt
     assert.equal(status(root, 'runtime-env-template'), 'fail')
     overwrite(root, '.env.example', baselineTemplate.replace('DATABASE_URL=', 'DATABASE_URL="postgres://example.com/app#token=percent%2Dencoded%2Dsecret"'))
     assert.equal(status(root, 'runtime-env-template'), 'fail')
+    for (const value of [
+      'postgres://example.com/app?sslpassword=live-secret',
+      'postgres://example.com/app?apiKey=live-secret',
+      'postgres://example.com/app?pwd=live-secret',
+      'postgres://example.com/app#opaque-live-secret',
+    ]) {
+      overwrite(root, '.env.example', baselineTemplate.replace('DATABASE_URL=', `DATABASE_URL="${value}"`))
+      assert.equal(status(root, 'runtime-env-template'), 'fail', value)
+    }
     overwrite(root, '.env.example', baselineTemplate)
 
     overwrite(root, 'next.config.ts', 'const active = true // Content-Security-Policy Referrer-Policy X-Content-Type-Options X-Frame-Options\nexport default { active }\n')
@@ -413,6 +427,17 @@ test('requires effective worker and command evidence instead of comments or empt
     overwrite(root, 'railway.toml', '[deploy]\nstartCommand = "echo /api/healthz && echo yarn db:migrate"\n')
     assert.equal(status(root, 'operations-health-check'), 'fail')
     assert.equal(status(root, 'release-database-migrations'), 'fail')
+    overwrite(root, 'railway.toml', '[build]\nhealthcheckPath = "/api/healthz"\nstartCommand = "yarn db:migrate"\n[deploy]\nstartCommand = "false && yarn db:migrate"\n')
+    assert.equal(status(root, 'operations-health-check'), 'fail')
+    assert.equal(status(root, 'release-database-migrations'), 'fail')
+    for (const healthcheck of [
+      'healthcheck:\n      disable: true\n      test: ["CMD", "curl", "http://localhost:3000/api/healthz"]',
+      'healthcheck:\n      test: ["CMD-SHELL", "echo curl http://localhost:3000/api/healthz"]',
+      'healthcheck:\n      test: ["CMD-SHELL", "curl http://localhost:3000/api/healthz || true"]',
+    ]) {
+      overwrite(root, 'docker-compose.fullapp.yml', `services:\n  app:\n    ${healthcheck}\n`)
+      assert.equal(status(root, 'operations-health-check'), 'fail', healthcheck)
+    }
 
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "yarn mercato worker"\n')
     overwrite(root, 'docker-compose.fullapp.yml', [
@@ -439,6 +464,8 @@ test('requires effective worker and command evidence instead of comments or empt
     overwrite(root, 'next.config.ts', 'const securityHeaders = [{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }]\nexport default { async headers() { const securityHeaders = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options"]; return [{ source: "/:path*", headers: securityHeaders }] } }\n')
     assert.equal(status(root, 'edge-security-headers'), 'fail')
     const validHeaders = '[{ key: "Content-Security-Policy", value: "frame-ancestors self" }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }]'
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'pass')
     overwrite(root, 'next.config.ts', `const decoy = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }\nexport default { async headers() { return [] } }\n`)
     assert.equal(status(root, 'edge-security-headers'), 'fail')
     overwrite(root, 'next.config.ts', `export default { async headers() { function decoy() { return [{ source: "/:path*", headers: ${validHeaders} }] } return [] } }\n`)
@@ -454,6 +481,12 @@ test('requires effective worker and command evidence instead of comments or empt
     overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, headers: async () => [] }\n`)
     assert.equal(status(root, 'edge-security-headers'), 'fail')
     overwrite(root, 'next.config.ts', `const headers = undefined; export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, headers }\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, "headers": undefined }\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, ["headers"]: undefined }\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: [{ key: "Content-Security-Policy", value: undefined }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }] }] }\n`)
     assert.equal(status(root, 'edge-security-headers'), 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')

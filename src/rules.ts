@@ -83,9 +83,19 @@ function displayPath(value: string): string {
 function missingSensitiveIgnoreCoverage(context: ScanContext): string[] {
   const source = context.readText('.gitignore') ?? ''
   if (!source.trim()) return ['all sensitive local artifacts']
+  const safeExceptions = new Set(['.env.example', '.env.sample', '.env.template'])
+  const unsafeException = source.split(/\r?\n/).map((line) => line.trim()).find((line) => {
+    if (!line.startsWith('!')) return false
+    const pattern = line.slice(1).replace(/^\//, '').toLowerCase()
+    if (safeExceptions.has(pattern)) return false
+    return pattern.includes('.env') || /(?:pem|\.key|npmrc|mcp\.json|session-exports)/.test(pattern)
+  })
+  if (unsafeException) return ['sensitive-path re-inclusion']
   const probes = [
     ['.env', '.env'],
     ['.env.production', '.env.production'],
+    ['.env.staging', '.env.staging'],
+    ['.envrc', '.envrc'],
     ['.env.local', '.env.local'],
     ['.env.*.local', '.env.preview.local'],
     ['*.pem', 'operator.pem'],
@@ -107,20 +117,23 @@ function unsafeTemplateValues(context: ScanContext): string[] {
   } catch {
     return ['unparseable template']
   }
-  const sensitiveName = /(?:^|_)(?:DATABASE_URL|REDIS_URL|PASSWORD|PASS|TOKEN|SECRET|PRIVATE_KEY|API_KEY|CREDENTIALS?)(?:$|_)/i
+  const sensitiveName = (name: string): boolean => /(?:databaseurl|redisurl|password|passwd|pwd|token|secret|privatekey|apikey|credentials?|sslpassword)/i
+    .test(name.replace(/[^A-Za-z0-9]/g, ''))
   const placeholder = /^(?:|changeme|replace[-_ ]?me|dummy|placeholder|example|<[^>]+>|\$\{[^}]+\})$/i
   const safeHost = (host: string): boolean => host === 'localhost' || host === '127.0.0.1' || host === '::1'
     || host === 'example.com' || host.endsWith('.example') || host.endsWith('.test')
   const unsafe: string[] = []
   for (const [key, raw] of Object.entries(values)) {
-    if (!sensitiveName.test(key) || raw === undefined) continue
+    if (!sensitiveName(key) || raw === undefined) continue
     const value = raw.trim()
     if (placeholder.test(value)) continue
     try {
       const url = new URL(value)
-      const sensitiveParameter = [...url.searchParams.entries()].some(([name, parameter]) => sensitiveName.test(name) && !placeholder.test(parameter))
+      const sensitiveParameter = [...url.searchParams.entries()].some(([name, parameter]) => sensitiveName(name) && !placeholder.test(parameter))
       const fragmentParameters = new URLSearchParams(url.hash.replace(/^#/, ''))
-      const sensitiveFragment = [...fragmentParameters.entries()].some(([name, parameter]) => sensitiveName.test(name) && !placeholder.test(parameter))
+      const fragment = decodeURIComponent(url.hash.replace(/^#/, '')).trim()
+      const sensitiveFragment = [...fragmentParameters.entries()].some(([name, parameter]) => sensitiveName(name) && !placeholder.test(parameter))
+        || (fragment.length > 0 && !placeholder.test(fragment) && !fragment.includes('='))
       if (sensitiveParameter || sensitiveFragment) {
         unsafe.push(key)
         continue
@@ -254,22 +267,41 @@ function uncommented(source: string): string {
 const DEPLOYMENT_FILES = ['Dockerfile', 'railway.toml', 'railway.worker.toml', 'scripts/railway-start.sh', 'scripts/railway-worker.sh', 'docker/scripts/init-or-migrate.sh'] as const
 const COMPOSE_FILES = ['docker-compose.yml', 'docker-compose.fullapp.yml'] as const
 
-function tomlString(source: string, field: string): string | null {
-  const match = new RegExp(`^\\s*${field}\\s*=\\s*["']([^"']+)["']\\s*$`, 'mi').exec(uncommented(source))
-  return match?.[1] ?? null
+function tomlSectionString(source: string, section: string, field: string): string | null {
+  let activeSection = ''
+  let value: string | null = null
+  for (const line of uncommented(source).split(/\r?\n/)) {
+    const sectionMatch = line.match(/^\s*\[([^\]]+)]\s*$/)
+    if (sectionMatch?.[1]) {
+      activeSection = sectionMatch[1].trim()
+      continue
+    }
+    if (activeSection !== section) continue
+    const fieldMatch = line.match(new RegExp(`^\\s*${field}\\s*=\\s*["']([^"']+)["']\\s*$`, 'i'))
+    if (fieldMatch?.[1]) value = fieldMatch[1]
+  }
+  return value
+}
+
+function executableHealthCheck(value: Record<string, unknown>): boolean {
+  if (value.disable === true || constantBoolean(value.disable, true)) return false
+  const test = value.test
+  const parts = Array.isArray(test) ? test.filter((entry): entry is string => typeof entry === 'string') : [String(test ?? '')]
+  if (!parts.length) return false
+  const command = parts.filter((entry, index) => index > 0 || !/^(?:CMD|CMD-SHELL)$/i.test(entry.trim())).join(' ').trim()
+  if (!command || !commandPreservesFailure(command) || hasNonExecutingFlag(command)) return false
+  return /^(?:(?:sh|bash)\s+(?:-[A-Za-z]*e[A-Za-z]*\s+)?-c\s+)?(?:curl|wget)\b[^\r\n;&|]*\/api\/healthz\b/i.test(command)
 }
 
 function configuredHealthCheck(context: ScanContext): boolean {
   const railway = context.readText('railway.toml')
-  if (railway && tomlString(railway, 'healthcheckPath') === '/api/healthz') return true
+  if (railway && tomlSectionString(railway, 'deploy', 'healthcheckPath') === '/api/healthz') return true
   for (const file of COMPOSE_FILES) {
     const services = composeServices(context, file)
     if (!services) continue
     if (services.some(([, service]) => {
       if (!isRecord(service.healthcheck)) return false
-      const test = service.healthcheck.test
-      const command = Array.isArray(test) ? test.join(' ') : String(test ?? '')
-      return /(?:curl|wget)[^\r\n]*\/api\/healthz\b/i.test(command)
+      return executableHealthCheck(service.healthcheck)
     })) return true
   }
   return false
@@ -278,12 +310,15 @@ function configuredHealthCheck(context: ScanContext): boolean {
 function executableMigrationCommand(command: string): boolean {
   const normalized = uncommented(command).trim()
   if (!normalized || !commandPreservesFailure(normalized) || /<<|;/.test(normalized)) return false
-  return normalized.split(/\s*&&\s*|\r?\n/).some((segment) => /^(?:exec\s+)?(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)(?:\s+[^;&|<\r\n]+)?$/i.test(segment.trim()))
+  const segments = normalized.split(/\s*&&\s*|\r?\n/).map((segment) => segment.trim()).filter(Boolean)
+  const migrationIndex = segments.findIndex((segment) => /^(?:exec\s+)?(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)(?:\s+[^;&|<\r\n]+)?$/i.test(segment))
+  if (migrationIndex < 0) return false
+  return !segments.slice(0, migrationIndex).some((segment) => /^(?:false|exit\s+[1-9]\d*|return\s+[1-9]\d*)$/i.test(segment))
 }
 
 function configuredMigration(context: ScanContext): boolean {
   const railway = context.readText('railway.toml')
-  const railwayCommand = railway ? tomlString(railway, 'startCommand') : null
+  const railwayCommand = railway ? tomlSectionString(railway, 'deploy', 'startCommand') : null
   if (railwayCommand && executableMigrationCommand(railwayCommand)) return true
   for (const file of ['scripts/railway-start.sh', 'docker/scripts/init-or-migrate.sh'] as const) {
     const source = context.readText(file)
@@ -504,7 +539,13 @@ function releaseTrigger(value: unknown): boolean {
   if (typeof value === 'string') return value === 'push' || value === 'release'
   if (Array.isArray(value)) return value.some((entry) => entry === 'push' || entry === 'release')
   if (!isRecord(value)) return false
-  if (Object.hasOwn(value, 'release')) return true
+  if (Object.hasOwn(value, 'release')) {
+    const release = value.release
+    if (!isRecord(release) || release.types === undefined) return true
+    const types = (Array.isArray(release.types) ? release.types : [release.types])
+      .filter((entry): entry is string => typeof entry === 'string')
+    if (types.some((type) => ['published', 'released', 'created'].includes(type))) return true
+  }
   if (!Object.hasOwn(value, 'push')) return false
   const push = value.push
   if (!isRecord(push)) return true
@@ -513,15 +554,21 @@ function releaseTrigger(value: unknown): boolean {
   const releaseBranches = new Set(['main', 'master', 'develop'])
   const ignoredBranches = new Set(strings(push['branches-ignore']))
   const branches = strings(push.branches)
+  const tags = strings(push.tags)
   const uncertainBranchIgnore = [...ignoredBranches].some((branch) => /[*?]/.test(branch) || branch.includes('['))
-  const branchPath = branches.length
+  const branchPath = tags.length > 0 && branches.length === 0
+    ? false
+    : branches.length
     ? branches.some((branch) => releaseBranches.has(branch))
     : !uncertainBranchIgnore && [...releaseBranches].some((branch) => !ignoredBranches.has(branch))
-  const tags = strings(push.tags)
   const ignoredTags = strings(push['tags-ignore'])
   const tagPath = tags.some((tag) => /^(?:v|release[-/])(?:\d|\*|\[)/i.test(tag))
     && !ignoredTags.some((tag) => /[*?]/.test(tag) || tag.includes('[') || /^(?:v|release[-/])\d/i.test(tag))
-  return branchPath || tagPath
+  const paths = strings(push.paths)
+  const ignoredPaths = strings(push['paths-ignore'])
+  const pathAllowsRelease = (paths.length === 0 || paths.some((path) => path === '**' || path === '**/*'))
+    && !ignoredPaths.some((path) => path === '*' || path === '**' || path === '**/*')
+  return pathAllowsRelease && (branchPath || tagPath)
 }
 
 function workflowJobs(workflow: string, source: string): WorkflowJob[] {
@@ -572,7 +619,7 @@ function commandPreservesFailure(command: string): boolean {
 }
 
 function hasNonExecutingFlag(command: string): boolean {
-  return /(?:^|\s)(?:--help|--version)(?:=|\s|$)|(?:^|\s)-(?:h|v)(?:\s|$)/i.test(command)
+  return /(?:^|\s)(?:--help|--version)(?:=|\s|$)|(?:^|\s)-(?:h|v)(?:=|\s|$)/i.test(command)
 }
 
 type DependencyMutation = 'immutable' | 'mutable'
@@ -734,7 +781,8 @@ function exportedConfigObject(source: string): { body: string, start: number } |
 
 function activeHeadersBody(configBody: string): string | null {
   const projection = topLevelProjection(configBody)
-  const properties = [...projection.matchAll(/(?:^|[,;])\s*headers\b/gm)]
+  if (/(?:^|[,;])\s*(?:["']headers["']|\[\s*["']headers["']\s*])\s*:/m.test(configBody)) return null
+  const properties = [...projection.matchAll(/(?:^|[,;])\s*(?:async\s+)?headers\b/gm)]
   const patterns = [
     /(?:^|[,;])\s*(?:async\s+)?headers\s*\([^)]*\)\s*\{/gm,
     /(?:^|[,;])\s*headers\s*:\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*(?:=>\s*)?\{/gm,
@@ -744,6 +792,8 @@ function activeHeadersBody(configBody: string): string | null {
   const effective = matches.at(-1)
   const effectiveProperty = properties.at(-1)
   if (!effective || !effectiveProperty || effective.index !== effectiveProperty.index) return null
+  const trailing = projection.slice((effective.index ?? 0) + effective[0].length)
+  if (/[,;]\s*\.\.\./m.test(trailing)) return null
   const openingBrace = projection.indexOf('{', effective.index)
   return extractDelimitedBody(configBody, openingBrace, '{', '}')
 }
@@ -792,7 +842,8 @@ function activeHeaderEntries(source: string): Map<string, string> {
   }
   for (const object of headerArrays.join('\n').match(/\{[^{}]*\}/g) ?? []) {
     const key = [...object.matchAll(/\bkey\s*:\s*["']([^"']+)["']/g)].at(-1)?.[1]
-    if (key && [...object.matchAll(/\bvalue\s*:/g)].length > 0) entries.set(key, object)
+    const value = [...object.matchAll(/\bvalue\s*:\s*([^,}]+)/g)].at(-1)?.[1]?.trim()
+    if (key && value && !/^(?:undefined|null|false|["']{2})$/i.test(value)) entries.set(key, object)
   }
   return entries
 }
