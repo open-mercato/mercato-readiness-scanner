@@ -37,6 +37,7 @@ function dependencies(context: ScanContext): ReadonlySet<string> {
 
 type TemplateInventory = {
   names: ReadonlySet<string>
+  values: ReadonlyMap<string, string>
   booleans: ReadonlyMap<string, boolean>
   integers: ReadonlyMap<string, number>
   enums: ReadonlyMap<string, string>
@@ -45,6 +46,7 @@ type TemplateInventory = {
 function templateInventory(context: ScanContext): TemplateInventory {
   const source = context.readText('.env.example') ?? ''
   const names = new Set<string>()
+  const templateValues = new Map<string, string>()
   const booleans = new Map<string, boolean>()
   const integers = new Map<string, number>()
   const enums = new Map<string, string>()
@@ -58,6 +60,7 @@ function templateInventory(context: ScanContext): TemplateInventory {
     if (!/^[A-Z][A-Z0-9_]*$/.test(key) || rawValue === undefined) continue
     names.add(key)
     const normalizedValue = rawValue.trim()
+    templateValues.set(key, normalizedValue)
     if (/(?:DEBUG|PROFILE|DEVTOOLS|AUTOLOGIN|TEST_INJECT|DEMO_MODE|EMERGENCY_BYPASS|INTEGRATION_TEST|AUTO_SPAWN_WORKERS)/.test(key)) {
       if (/^(?:1|true|yes|y|on|enabled)$/i.test(normalizedValue)) booleans.set(key, true)
       if (/^(?:0|false|no|n|off|disabled)$/i.test(normalizedValue)) booleans.set(key, false)
@@ -65,7 +68,7 @@ function templateInventory(context: ScanContext): TemplateInventory {
     if (key === 'RATE_LIMIT_TRUST_PROXY_DEPTH' && /^-?\d+$/.test(normalizedValue)) integers.set(key, Number(normalizedValue))
     if (key === 'CACHE_STRATEGY' && /^(?:redis|memory|sqlite)$/i.test(normalizedValue)) enums.set(key, normalizedValue.toLowerCase())
   }
-  return { names, booleans, integers, enums }
+  return { names, values: templateValues, booleans, integers, enums }
 }
 
 function containsAll(source: string, values: string[]): boolean {
@@ -313,7 +316,7 @@ function executableMigrationCommand(command: string): boolean {
   const segments = normalized.split(/\s*&&\s*|\r?\n/).map((segment) => segment.trim()).filter(Boolean)
   const migrationIndex = segments.findIndex((segment) => /^(?:exec\s+)?(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)(?:\s+[^;&|<\r\n]+)?$/i.test(segment))
   if (migrationIndex < 0) return false
-  return !segments.slice(0, migrationIndex).some((segment) => /^(?:false|exit\s+[1-9]\d*|return\s+[1-9]\d*)$/i.test(segment))
+  return !segments.slice(0, migrationIndex).some((segment) => /^(?:false|exit\b|return\b|exec\b)/i.test(segment))
 }
 
 function configuredMigration(context: ScanContext): boolean {
@@ -781,7 +784,8 @@ function exportedConfigObject(source: string): { body: string, start: number } |
 
 function activeHeadersBody(configBody: string): string | null {
   const projection = topLevelProjection(configBody)
-  if (/(?:^|[,;])\s*(?:["']headers["']|\[\s*["']headers["']\s*])\s*:/m.test(configBody)) return null
+  if (/(?:^|[,;])\s*(?:["']headers["']|\[\s*["']headers["']\s*])\s*:/m.test(configBody)
+    || /(?:^|[,;])\s*get\s+headers\s*\(/m.test(projection)) return null
   const properties = [...projection.matchAll(/(?:^|[,;])\s*(?:async\s+)?headers\b/gm)]
   const patterns = [
     /(?:^|[,;])\s*(?:async\s+)?headers\s*\([^)]*\)\s*\{/gm,
@@ -793,7 +797,7 @@ function activeHeadersBody(configBody: string): string | null {
   const effectiveProperty = properties.at(-1)
   if (!effective || !effectiveProperty || effective.index !== effectiveProperty.index) return null
   const trailing = projection.slice((effective.index ?? 0) + effective[0].length)
-  if (/[,;]\s*\.\.\./m.test(trailing)) return null
+  if (/[,;]\s*(?:\.\.\.|\[)/m.test(trailing)) return null
   const openingBrace = projection.indexOf('{', effective.index)
   return extractDelimitedBody(configBody, openingBrace, '{', '}')
 }
@@ -843,7 +847,7 @@ function activeHeaderEntries(source: string): Map<string, string> {
   for (const object of headerArrays.join('\n').match(/\{[^{}]*\}/g) ?? []) {
     const key = [...object.matchAll(/\bkey\s*:\s*["']([^"']+)["']/g)].at(-1)?.[1]
     const value = [...object.matchAll(/\bvalue\s*:\s*([^,}]+)/g)].at(-1)?.[1]?.trim()
-    if (key && value && !/^(?:undefined|null|false|["']{2})$/i.test(value)) entries.set(key, object)
+    if (key && value && /^(?:"[^"\r\n]+"|'[^'\r\n]+'|`[^`]+`)$/i.test(value)) entries.set(key, object)
   }
   return entries
 }
@@ -938,7 +942,7 @@ export const RULES: readonly RuleDefinition[] = [
       const inventory = templateInventory(context)
       if (!inventory.names.has('RATE_LIMIT_TRUST_PROXY_DEPTH')) return { status: 'fail', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH is absent from the configuration template.' }
       const depth = inventory.integers.get('RATE_LIMIT_TRUST_PROXY_DEPTH')
-      if (depth !== undefined && depth < 0) return { status: 'fail', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH cannot be negative.' }
+      if (depth === undefined || depth < 0) return { status: 'fail', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH must be a non-negative integer.' }
       return { status: 'warning', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH is documented; verify its live value matches the deployed proxy chain.' }
     },
   }),
@@ -952,8 +956,22 @@ export const RULES: readonly RuleDefinition[] = [
       if (installed.has('@open-mercato/checkout')) required.push('CHECKOUT_ALLOWED_ORIGINS')
       if (installed.has('@open-mercato/documents')) required.push('DOCUMENTS_COLLAB_ALLOWED_ORIGINS')
       const missing = required.filter((key) => !inventory.names.has(key))
-      return missing.length
-        ? { status: 'fail', summary: 'Origin allowlist configuration is incomplete.', evidence: missing.map((key) => `Missing template key: ${key}`) }
+      if (missing.length) return { status: 'fail', summary: 'Origin allowlist configuration is incomplete.', evidence: missing.map((key) => `Missing template key: ${key}`) }
+      const invalid = required.filter((key) => {
+        const value = inventory.values.get(key) ?? ''
+        if (!value) return false
+        return value.split(',').map((origin) => origin.trim()).some((origin) => {
+          try {
+            const url = new URL(origin)
+            return url.protocol !== 'https:' || Boolean(url.username || url.password) || url.pathname !== '/' || Boolean(url.search || url.hash)
+              || url.hostname.includes('*')
+          } catch {
+            return true
+          }
+        })
+      })
+      return invalid.length
+        ? { status: 'fail', summary: 'Origin allowlist template values must contain only exact HTTPS origins.', evidence: invalid.map((key) => `Invalid template origin list: ${key}`) }
         : { status: 'warning', summary: 'Origin allowlist keys are present; verify that live values contain only intended HTTPS origins.' }
     },
   }),
@@ -1060,11 +1078,9 @@ export const RULES: readonly RuleDefinition[] = [
         .map((file) => context.readText(file) ?? '').join('\n')
       const images = [...source.matchAll(/^\s*image\s*[:=]\s*["']?([^\s"']+)/gmi)].map((match) => match[1] ?? '')
       if (!images.length) return { status: 'warning', summary: 'No in-repository production image reference proves immutable artifact selection.' }
-      const mutable = images.filter((image) => /:latest$|:(?:main|master|develop|dev)$/i.test(image))
-      if (mutable.length) return { status: 'fail', summary: 'Production configuration uses mutable image references.', evidence: mutable.map((image) => `Mutable image reference: ${displayPath(image)}`) }
       const unpinned = images.filter((image) => !/@sha256:[a-f0-9]{64}$/i.test(image) && !/:[a-f0-9]{7,40}$/i.test(image) && !/github\.sha/i.test(image))
       return unpinned.length
-        ? { status: 'warning', summary: 'Image references exist, but the scanner cannot prove they are immutable.', evidence: unpinned.map((image) => `Review image reference: ${displayPath(image)}`) }
+        ? { status: 'fail', summary: 'Production image references are not pinned to a digest or commit-derived identifier.', evidence: unpinned.map((image) => `Unpinned image reference: ${displayPath(image)}`) }
         : { status: 'pass', summary: 'Production image references use a digest or commit-derived identifier.' }
     },
   }),
@@ -1112,8 +1128,19 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const installed = dependencies(context)
       if (!installed.has('@open-mercato/documents') && !installed.has('@open-mercato/core')) return { status: 'skipped', summary: 'No storage-owning Open Mercato package was detected.' }
-      const source = context.collectDeploymentText()
-      return /(?:volume|storage|upload|s3)/i.test(source)
+      const composeStorage = COMPOSE_FILES.some((file) => (composeServices(context, file) ?? []).some(([, service]) => {
+        if (!Array.isArray(service.volumes)) return false
+        return service.volumes.some((volume) => {
+          if (typeof volume === 'string') return /(?:^|:)(?:\/[^:\s]*)?(?:storage|uploads?|documents?|attachments?|media)(?:\/[^:\s]*)?$/i.test(volume)
+          return isRecord(volume) && typeof volume.target === 'string'
+            && /(?:^|\/)(?:storage|uploads?|documents?|attachments?|media)(?:\/|$)/i.test(volume.target)
+            && volume.type !== 'tmpfs'
+        })
+      }))
+      const source = context.collectDeploymentText().replace(/\s+/g, ' ')
+      const durableStorageRunbook = /(?:uploads?|documents?|attachments?|media).{0,160}(?:persistent\s+(?:volume|disk|media)|object\s+storage|s3\b)/i.test(source)
+        || /(?:persistent\s+(?:volume|disk|media)|object\s+storage|s3\b).{0,160}(?:uploads?|documents?|attachments?|media)/i.test(source)
+      return composeStorage || durableStorageRunbook
         ? { status: 'warning', summary: 'Storage configuration is present; verify durability, capacity alerts, and restore coverage in the live environment.' }
         : { status: 'fail', summary: 'No persistent storage configuration or runbook was found.' }
     },

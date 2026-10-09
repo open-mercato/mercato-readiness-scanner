@@ -430,6 +430,10 @@ test('requires effective worker and command evidence instead of comments or empt
     overwrite(root, 'railway.toml', '[build]\nhealthcheckPath = "/api/healthz"\nstartCommand = "yarn db:migrate"\n[deploy]\nstartCommand = "false && yarn db:migrate"\n')
     assert.equal(status(root, 'operations-health-check'), 'fail')
     assert.equal(status(root, 'release-database-migrations'), 'fail')
+    for (const command of ['exit 0 && yarn db:migrate', 'exec true && yarn db:migrate']) {
+      overwrite(root, 'railway.toml', `[deploy]\nstartCommand = "${command}"\n`)
+      assert.equal(status(root, 'release-database-migrations'), 'fail', command)
+    }
     for (const healthcheck of [
       'healthcheck:\n      disable: true\n      test: ["CMD", "curl", "http://localhost:3000/api/healthz"]',
       'healthcheck:\n      test: ["CMD-SHELL", "echo curl http://localhost:3000/api/healthz"]',
@@ -488,6 +492,26 @@ test('requires effective worker and command evidence instead of comments or empt
     assert.equal(status(root, 'edge-security-headers'), 'fail')
     overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: [{ key: "Content-Security-Policy", value: undefined }, { key: "Referrer-Policy", value: "same-origin" }, { key: "X-Content-Type-Options", value: "nosniff" }] }] }\n`)
     assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `const effectiveKey = "headers"; export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, [effectiveKey]: undefined }\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, get headers() { return undefined } }\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', 'export default { async headers() { return [{ source: "/:path*", headers: [{ key: "Content-Security-Policy", value: true }, { key: "Referrer-Policy", value: false }, { key: "X-Content-Type-Options", value: 1 }] }] }\n')
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+
+    const validTemplate = fs.readFileSync(path.join(root, '.env.example'), 'utf8')
+    overwrite(root, '.env.example', validTemplate.replace('RATE_LIMIT_TRUST_PROXY_DEPTH=1', 'RATE_LIMIT_TRUST_PROXY_DEPTH=unbounded'))
+    assert.equal(status(root, 'edge-trusted-proxy-depth'), 'fail')
+    overwrite(root, '.env.example', validTemplate.replace(/^APP_ALLOWED_ORIGINS=.*$/m, 'APP_ALLOWED_ORIGINS=*'))
+    assert.equal(status(root, 'edge-allowed-origins'), 'fail')
+    overwrite(root, '.env.example', validTemplate)
+
+    overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:stable\n')
+    assert.equal(status(root, 'release-immutable-artifact'), 'fail')
+    overwrite(root, 'docker-compose.yml', '')
+    overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    volumes: ["/tmp/cache:/tmp/cache"]\n')
+    overwrite(root, 'docs/operations.md', 'TLS HTTPS certificate backup restore rollback worker\n')
+    assert.equal(status(root, 'storage-persistent-volume'), 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
     assert.equal(status(root, 'supply-chain-immutable-install'), 'fail')
