@@ -89,22 +89,27 @@ type ComposeService = { name: string, lines: string[] }
 
 function composeServices(source: string): ComposeService[] {
   const services: ComposeService[] = []
-  let inServices = false
+  let servicesIndent: number | null = null
+  let serviceIndent: number | null = null
   let current: ComposeService | null = null
   for (const line of source.split(/\r?\n/)) {
-    if (/^services:\s*(?:#.*)?$/.test(line)) {
-      inServices = true
+    const servicesMatch = line.match(/^(\s*)services:\s*(?:#.*)?$/)
+    if (servicesMatch) {
+      servicesIndent = servicesMatch[1]?.length ?? 0
       continue
     }
-    if (inServices && /^\S[^:]*:\s*/.test(line)) {
-      if (current) services.push(current)
-      break
+    if (servicesIndent === null) continue
+    if (!line.trim() || /^\s*#/.test(line)) {
+      if (current) current.lines.push(line)
+      continue
     }
-    if (!inServices) continue
-    const serviceMatch = line.match(/^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)
-    if (serviceMatch?.[1]) {
+    const indent = line.length - line.trimStart().length
+    if (indent <= servicesIndent) break
+    const serviceMatch = line.match(/^(\s*)([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)
+    if (serviceIndent === null && serviceMatch?.[2]) serviceIndent = indent
+    if (serviceMatch?.[2] && indent === serviceIndent) {
       if (current) services.push(current)
-      current = { name: serviceMatch[1], lines: [] }
+      current = { name: serviceMatch[2], lines: [] }
       continue
     }
     if (current) current.lines.push(line)
@@ -217,38 +222,104 @@ function yamlFalse(value: string): boolean {
   return /^(?:false|['"]false['"]|\$\{\{\s*false\s*\}\})\s*$/i.test(value.trim())
 }
 
+function yamlTrue(value: string): boolean {
+  return /^(?:true|['"]true['"]|\$\{\{\s*true\s*\}\})\s*$/i.test(value.trim())
+}
+
+function indentation(line: string): number {
+  return line.length - line.trimStart().length
+}
+
 function workflowCommands(source: string): WorkflowCommand[] {
   const lines = source.split(/\r?\n/)
   const commands: WorkflowCommand[] = []
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index] ?? ''
-    const runMatch = line.match(/^(\s*)(?:-\s*)?run:\s*(.*?)\s*$/)
+    const runMatch = line.match(/^(\s*)(-\s*)?run:\s*(.*?)\s*$/)
     if (!runMatch) continue
-    const runIndent = runMatch[1]?.length ?? 0
+    const runIndent = (runMatch[1]?.length ?? 0) + (runMatch[2]?.length ?? 0)
     let stepStart = index
     for (let previous = index; previous >= 0; previous -= 1) {
       const candidate = lines[previous] ?? ''
       const listMatch = candidate.match(/^(\s*)-\s+/)
-      if (listMatch && (listMatch[1]?.length ?? 0) <= runIndent) {
+      if (listMatch && (listMatch[1]?.length ?? 0) < runIndent) {
         stepStart = previous
         break
       }
     }
-    let jobStart = -1
-    for (let previous = index; previous >= 0; previous -= 1) {
-      if (/^  [A-Za-z0-9_.-]+:\s*(?:#.*)?$/.test(lines[previous] ?? '')) {
-        jobStart = previous
+    const stepIndent = indentation(lines[stepStart] ?? '')
+    let stepEnd = lines.length
+    for (let candidate = stepStart + 1; candidate < lines.length; candidate += 1) {
+      const candidateLine = lines[candidate] ?? ''
+      if (!candidateLine.trim() || /^\s*#/.test(candidateLine)) continue
+      const candidateIndent = indentation(candidateLine)
+      if (candidateIndent < stepIndent || (candidateIndent === stepIndent && /^\s*-\s+/.test(candidateLine))) {
+        stepEnd = candidate
         break
       }
     }
-    const stepPrefix = lines.slice(stepStart, index + 1)
-    const jobPrefix = jobStart >= 0 ? lines.slice(jobStart, index + 1) : []
-    const disabled = [...stepPrefix, ...jobPrefix].some((candidate) => {
+    let jobsStart = -1
+    for (let previous = index; previous >= 0; previous -= 1) {
+      if (/^\s*jobs:\s*(?:#.*)?$/.test(lines[previous] ?? '')) {
+        jobsStart = previous
+        break
+      }
+    }
+    let jobStart = -1
+    let jobEnd = lines.length
+    let jobIndent: number | null = null
+    let jobsIndent: number | null = null
+    if (jobsStart >= 0) {
+      jobsIndent = indentation(lines[jobsStart] ?? '')
+      for (let candidate = jobsStart + 1; candidate <= index; candidate += 1) {
+        const candidateLine = lines[candidate] ?? ''
+        if (!candidateLine.trim() || /^\s*#/.test(candidateLine)) continue
+        const candidateIndent = indentation(candidateLine)
+        if (candidateIndent <= jobsIndent) break
+        const key = candidateLine.match(/^\s*([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)?.[1]
+        if (jobIndent === null && key) jobIndent = candidateIndent
+        if (key && candidateIndent === jobIndent) jobStart = candidate
+      }
+      if (jobStart >= 0 && jobIndent !== null) {
+        for (let candidate = jobStart + 1; candidate < lines.length; candidate += 1) {
+          const candidateLine = lines[candidate] ?? ''
+          if (!candidateLine.trim() || /^\s*#/.test(candidateLine)) continue
+          const candidateIndent = indentation(candidateLine)
+          const key = candidateLine.match(/^\s*([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)?.[1]
+          if (candidateIndent <= jobsIndent || (key && candidateIndent === jobIndent)) {
+            jobEnd = candidate
+            break
+          }
+        }
+      }
+    }
+    const stepLines = lines.slice(stepStart, stepEnd)
+    const stepFieldIndent = stepLines.reduce<number | null>((minimum, candidate, offset) => {
+      if (offset === 0 || !candidate.trim() || /^\s*#/.test(candidate)) return minimum
+      const candidateIndent = indentation(candidate)
+      if (candidateIndent <= stepIndent) return minimum
+      return minimum === null ? candidateIndent : Math.min(minimum, candidateIndent)
+    }, null)
+    const stepControl = stepLines.filter((candidate, offset) => offset === 0 || (stepFieldIndent !== null && indentation(candidate) === stepFieldIndent))
+    const jobLines = jobStart >= 0 ? lines.slice(jobStart + 1, jobEnd) : []
+    const jobFieldIndent = jobIndent === null
+      ? null
+      : jobLines.reduce<number | null>((minimum, candidate) => {
+        if (!candidate.trim() || /^\s*#/.test(candidate)) return minimum
+        const candidateIndent = indentation(candidate)
+        if (candidateIndent <= jobIndent) return minimum
+        return minimum === null ? candidateIndent : Math.min(minimum, candidateIndent)
+      }, null)
+    const jobControl = jobFieldIndent === null ? [] : jobLines.filter((candidate) => indentation(candidate) === jobFieldIndent)
+    const disabled = [...stepControl, ...jobControl].some((candidate) => {
       const condition = candidate.match(/^\s*(?:-\s*)?if:\s*(.*?)\s*(?:#.*)?$/)?.[1]
       return condition !== undefined && yamlFalse(condition)
     })
-    const nonBlocking = stepPrefix.some((candidate) => /^\s*(?:-\s*)?continue-on-error:\s*true\s*(?:#.*)?$/i.test(candidate))
-    let command = runMatch[2] ?? ''
+    const nonBlocking = [...stepControl, ...jobControl].some((candidate) => {
+      const value = candidate.match(/^\s*(?:-\s*)?continue-on-error:\s*(.*?)\s*(?:#.*)?$/i)?.[1]
+      return value !== undefined && yamlTrue(value)
+    })
+    let command = runMatch[3] ?? ''
     if (/^[|>][-+]?\s*$/.test(command)) {
       const block: string[] = []
       for (let nested = index + 1; nested < lines.length; nested += 1) {
@@ -278,13 +349,28 @@ function requiresNode24OrNewer(range: string): boolean {
   const clauses = range.split('||').map((clause) => clause.trim()).filter(Boolean)
   if (!clauses.length) return false
   return clauses.every((clause) => {
-    const hyphen = clause.match(/^v?(\d+)(?:\.\d+){0,2}\s+-\s+v?\d+/)
+    const hyphen = clause.match(/^v?(\d+)(?:\.(?:\d+|[x*])){0,2}(?:-[0-9A-Za-z.-]+)?\s+-\s+v?\d+(?:\.(?:\d+|[x*])){0,2}(?:-[0-9A-Za-z.-]+)?$/i)
     if (hyphen?.[1]) return Number(hyphen[1]) >= 24
-    const exact = clause.match(/^[~^]?\s*v?(\d+)(?:\.(?:\d+|[x*])){0,2}$/i)
-    if (exact?.[1]) return Number(exact[1]) >= 24
-    const lower = clause.match(/(?:^|\s)(>=|>|\^|~)\s*v?(\d+)(?:\.\d+){0,2}/)
-    if (!lower?.[1] || !lower[2]) return false
-    return Number(lower[2]) >= 24
+    const normalized = clause.replace(/(<=|>=|<|>|=|\^|~)\s+/g, '$1')
+    const tokens = normalized.split(/\s+/).filter(Boolean)
+    let strongestLowerMajor: number | null = null
+    let exactMajor: number | null = null
+    for (const token of tokens) {
+      if (token === '*' || /^x$/i.test(token)) return false
+      const match = token.match(/^(<=|>=|<|>|=|\^|~)?v?(\d+)(?:\.(?:\d+|[x*])){0,2}(?:-[0-9A-Za-z.-]+)?$/i)
+      if (!match?.[2]) return false
+      const operator = match[1] ?? '='
+      const major = Number(match[2])
+      if (operator === '<' || operator === '<=') continue
+      if (operator === '=') {
+        if (exactMajor !== null && exactMajor !== major) return false
+        exactMajor = major
+      }
+      if (operator === '>' && major < 24) continue
+      strongestLowerMajor = strongestLowerMajor === null ? major : Math.max(strongestLowerMajor, major)
+    }
+    if (exactMajor !== null && exactMajor < 24) return false
+    return strongestLowerMajor !== null && strongestLowerMajor >= 24
   })
 }
 
@@ -427,7 +513,9 @@ export const RULES: readonly RuleDefinition[] = [
       const source = context.readText('Dockerfile')
       if (!source) return { status: 'skipped', summary: 'No Dockerfile is present.' }
       const user = finalDockerUser(source)
-      return user !== null && user !== 'root' && user !== '0'
+      const userId = user?.split(':', 1)[0] ?? ''
+      const nonRoot = userId !== '' && !/[${}]/.test(userId) && userId !== 'root' && !/^0+$/.test(userId)
+      return nonRoot
         ? { status: 'pass', summary: 'The final container user is non-root.', evidence: ['A final USER directive is present.'] }
         : { status: 'fail', summary: 'The production image does not end with a non-root USER directive.' }
     },

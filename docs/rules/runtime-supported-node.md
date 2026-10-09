@@ -5,6 +5,8 @@
 
 Local, CI, image, and provider builds should use a supported Node.js major. The
 scanner checks that `package.json` requires Node.js 24 or newer.
+It recognizes exact, equality, caret, tilde, wildcard-major, comparator-set,
+hyphen, and OR forms; unsupported or ambiguous range syntax fails closed.
 
 ## Remediation
 

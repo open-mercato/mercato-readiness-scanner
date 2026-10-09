@@ -19,8 +19,11 @@ function status(root: string, id: string): FindingStatus | undefined {
 test('detects public Compose bindings across inline, short, long, and image-identified services', () => {
   const variants = [
     'services:\n  postgres:\n    ports: ["5432:5432"]\n',
+    'services:\n    postgres:\n        ports: ["5432:5432"]\n',
     'services:\n  redis:\n    ports:\n      - "6379:6379"\n',
+    'services:\n    redis:\n        ports:\n            - "6379:6379"\n',
     'services:\n  database:\n    image: postgres:17\n    ports:\n      - target: 5432\n        published: 5432\n',
+    'services:\n    database:\n        image: postgres:17\n        ports:\n            - target: 5432\n              published: 5432\n',
   ]
   for (const source of variants) {
     const root = makeAppFixture()
@@ -59,6 +62,10 @@ test('requires a non-root USER in the final Docker stage', () => {
   const root = makeAppFixture()
   try {
     overwrite(root, 'Dockerfile', 'FROM node:24 AS build\nUSER app\nFROM node:24\nCOPY --from=build /app /app\n')
+    assert.equal(status(root, 'container-non-root-user'), 'fail')
+    overwrite(root, 'Dockerfile', 'FROM node:24\nUSER root:root\n')
+    assert.equal(status(root, 'container-non-root-user'), 'fail')
+    overwrite(root, 'Dockerfile', 'FROM node:24\nUSER 0:0\n')
     assert.equal(status(root, 'container-non-root-user'), 'fail')
     overwrite(root, 'Dockerfile', 'FROM node:24 AS build\nUSER root\nFROM node:24\nUSER app\n')
     assert.equal(status(root, 'container-non-root-user'), 'pass')
@@ -100,6 +107,31 @@ test('counts only active blocking workflow commands as release validation', () =
       '      - run: yarn build',
       '      - run: yarn test',
       '      - run: yarn db:migrate --check',
+      '    continue-on-error: ${{ true }}',
+    ].join('\n'))
+    assert.equal(status(root, 'release-validation-gate'), 'fail')
+
+    overwrite(root, '.github/workflows/release.yml', [
+      'jobs:',
+      '  validate:',
+      '    steps:',
+      '      - run: |',
+      '          yarn generate',
+      '          yarn build',
+      '      - run: yarn test',
+      '        continue-on-error: true',
+      '      - run: yarn db:migrate --check',
+    ].join('\n'))
+    assert.equal(status(root, 'release-validation-gate'), 'fail')
+
+    overwrite(root, '.github/workflows/release.yml', [
+      'jobs:',
+      '  validate:',
+      '    steps:',
+      '      - run: yarn generate',
+      '      - run: yarn build',
+      '      - run: yarn test',
+      '      - run: yarn db:migrate --check',
     ].join('\n'))
     assert.equal(status(root, 'release-validation-gate'), 'pass')
   } finally {
@@ -124,12 +156,12 @@ test('rejects Node engine ranges with any unsupported alternative', () => {
   try {
     const packagePath = path.join(root, 'package.json')
     const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8')) as { engines: { node: string } }
-    for (const range of ['>=24', '^24.0.0', '24.x', '>=24 <27']) {
+    for (const range of ['>=24', '^24.0.0', '24.x', '=24.0.0', '24.0.0 - 26.0.0', '>=24 <27', '24 || >=26']) {
       packageJson.engines.node = range
       fs.writeFileSync(packagePath, JSON.stringify(packageJson))
       assert.equal(status(root, 'runtime-supported-node'), 'pass', range)
     }
-    for (const range of ['>=18 <19 || >=24', '>=18', '<25', '23.x']) {
+    for (const range of ['>=18 <19 || >=24', '>=18', '<25', '23.x', '*', 'not-a-range']) {
       packageJson.engines.node = range
       fs.writeFileSync(packagePath, JSON.stringify(packageJson))
       assert.equal(status(root, 'runtime-supported-node'), 'fail', range)
