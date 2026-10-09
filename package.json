@@ -2,7 +2,27 @@
   "name": "@open-mercato/readiness-scanner",
   "version": "0.1.0",
   "description": "Static production-readiness scanner for Open Mercato applications.",
-  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/open-mercato/mercato-readiness-scanner.git"
+  },
+  "homepage": "https://github.com/open-mercato/mercato-readiness-scanner#readme",
+  "bugs": "https://github.com/open-mercato/mercato-readiness-scanner/issues",
+  "keywords": ["open-mercato", "security", "readiness", "cli", "typescript"],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./report.schema.json": "./docs/report.schema.json"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "type": "module",
   "bin": {
     "mercato-readiness": "dist/cli.js"
@@ -16,15 +36,27 @@
     "node": ">=24.0.0"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/finalize-build.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
-    "pack:check": "node scripts/check-package.mjs",
-    "check": "npm run typecheck && npm test && npm run build && npm run pack:check"
+    "build": "tsc -p tsconfig.json && node --import tsx scripts/finalize-build.ts",
+    "lint": "eslint . --max-warnings 0",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "test": "npm run test:unit && npm run test:integration",
+    "test:unit": "node --import tsx --test test/unit/*.test.ts",
+    "test:integration": "node --import tsx --test test/scanner.test.ts test/cli.test.ts",
+    "test:standalone": "npm run build && node --import tsx --test test/standalone/*.test.ts",
+    "pack:check": "node --import tsx scripts/check-package.ts",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run check && npm run test:standalone",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build && npm run pack:check"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^26.4.0",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "eslint": "^10.12.0",
+    "jiti": "^2.7.0",
     "tsx": "^4.7.0",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.71.1"
   }
 }

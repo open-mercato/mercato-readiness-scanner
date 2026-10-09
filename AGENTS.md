@@ -3,7 +3,8 @@
 ## Always
 
 - Keep the scanner read-only with respect to the scanned application.
-- Never read value-bearing `.env*` files, credentials, private keys, token caches, or secret stores.
+- Production `.env` files and relevant process environment variables may be read locally for configuration checks, as explicitly authorized by the user. Never execute them or include their values in reports or diagnostics.
+- Never read private-key files, token caches, or external secret stores. Service credentials are checked only in the authorized environment configuration.
 - Keep findings deterministic and evidence free of secret values and absolute home paths.
 - Give every rule a stable ID and its own matching `docs/rules/<rule-id>.md` page.
 - Preserve the JSON schema version and document incompatible report changes.

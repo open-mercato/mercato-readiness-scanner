@@ -4,10 +4,10 @@
 **Severity:** High
 
 Debugging, profiling, autologin, test injection, and browser DevTools switches
-can reveal data or weaken controls when enabled in production. The scanner checks
-only allowlisted boolean template defaults and never reads live environment
-values, so a safe template remains an operator-verification result rather than
-proof of the live state.
+can reveal data or weaken controls when enabled in production. This rule checks only allowlisted boolean template defaults, so a safe template
+remains an operator-verification result. The separate
+[runtime-tracing-disabled](runtime-tracing-disabled.md) rule inspects effective
+production environment settings locally without reporting their values.
 
 ## Remediation
 

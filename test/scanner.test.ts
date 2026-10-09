@@ -8,12 +8,14 @@ import { readSafeText } from '../src/files.js'
 import { formatJson, formatMarkdown, formatTerminal } from '../src/formatters.js'
 import { RULES } from '../src/rules.js'
 import { scan } from '../src/scan.js'
-import { makeAppFixture, removeFixture } from './fixture.js'
+import { makeAppFixture, PRODUCTION_ENV, removeFixture } from './fixture.js'
+import { assertReport } from './report-contract.js'
 
 test('scans a generated application and returns one result per documented rule', () => {
   const root = makeAppFixture()
   try {
     const report = scan(path.join(root, 'src'), new Date('2026-10-09T12:00:00.000Z'))
+    assertReport(report)
     assert.equal(report.schemaVersion, 1)
     assert.equal(report.target, path.basename(root))
     assert.equal(report.summary.total, RULES.length)
@@ -26,7 +28,7 @@ test('scans a generated application and returns one result per documented rule',
   }
 })
 
-test('never reads a tracked live environment file or exposes its value', () => {
+test('inspects authorized production configuration without exposing tracked secret values', () => {
   const root = makeAppFixture()
   const secret = 'SHOULD_NOT_APPEAR_7d51f9'
   try {
@@ -104,4 +106,37 @@ test('every rule has a matching standalone documentation page', () => {
     assert.equal(source.includes(`**Rule ID:** \`${rule.id}\``), true)
     assert.match(source, /## Remediation/)
   }
+})
+
+test('checks dotenv and inherited deployment settings, redacts all formats, and never runs target scripts', () => {
+  const root = makeAppFixture()
+  const marker = 'PRIVATE_SECRET_MARKER_83a918bbea91ab3'
+  try {
+    const env = Object.entries(PRODUCTION_ENV).map(([key, value]) => `${key}=${value}`).join('\n')
+    fs.writeFileSync(path.join(root, '.env.production'), `${env}\nJWT_SECRET=${marker}\n`, { mode: 0o600 })
+    fs.mkdirSync(path.join(root, 'uploads'), { mode: 0o700 })
+    fs.writeFileSync(path.join(root, 'uploads', 'private.txt'), 'PRIVATE_UPLOAD_CONTENT', { mode: 0o600 })
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as Record<string, unknown>
+    manifest.scripts = { build: 'touch TARGET_SCRIPT_EXECUTED', start: 'touch TARGET_SCRIPT_EXECUTED' }
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify(manifest))
+    const report = scan(root, { environment: {} })
+    for (const id of ['secrets-jwt-signing', 'data-tenant-encryption-enabled', 'data-encryption-key-config', 'services-postgres-credentials', 'services-redis-credentials', 'runtime-production-environment', 'runtime-tracing-disabled', 'permissions-env-files', 'permissions-upload-directories']) {
+      assert.equal(report.results.find((rule) => rule.id === id)?.status, 'pass', id)
+    }
+    const override = scan(root, { environment: { JWT_SECRET: 'weak', TENANT_DATA_ENCRYPTION: 'no' } })
+    assert.equal(override.results.find(({ id }) => id === 'secrets-jwt-signing')?.status, 'fail')
+    assert.equal(override.results.find(({ id }) => id === 'data-tenant-encryption-enabled')?.status, 'fail')
+    for (const output of [formatJson(report), formatMarkdown(report), formatTerminal(report, false)]) {
+      assert.equal(output.includes(marker), false)
+      assert.equal(output.includes('PRIVATE_UPLOAD_CONTENT'), false)
+      assert.equal(output.includes(root), false)
+      for (const value of Object.values(PRODUCTION_ENV).filter((value) => value.length > 25)) assert.equal(output.includes(value), false)
+    }
+    assert.equal(fs.existsSync(path.join(root, 'TARGET_SCRIPT_EXECUTED')), false)
+    fs.chmodSync(path.join(root, 'uploads', 'private.txt'), 0o666)
+    fs.chmodSync(path.join(root, '.env.production'), 0o644)
+    const permissions = scan(root, { environment: {} })
+    assert.equal(permissions.results.find(({ id }) => id === 'permissions-upload-directories')?.status, 'fail')
+    assert.equal(permissions.results.find(({ id }) => id === 'permissions-env-files')?.status, 'fail')
+  } finally { removeFixture(root) }
 })

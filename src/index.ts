@@ -1,4 +1,5 @@
-export { InvalidTargetError, scan, VERSION } from './scan.js'
+export { InvalidRuleSelectionError, InvalidTargetError, scan, VERSION } from './scan.js'
+export type { ScanOptions } from './scan.js'
 export { RULES } from './rules.js'
 export { formatJson, formatMarkdown, formatTerminal } from './formatters.js'
 export type { FindingStatus, RuleResult, ScanReport, Severity } from './types.js'

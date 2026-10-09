@@ -5,8 +5,9 @@
 
 Value-bearing `.env*` files can expose database credentials, signing secrets,
 provider tokens, and encryption material to every person and system with source
-access. The scanner asks Git only for tracked path names; it never opens those
-files or reports their values. Sanitized `.env.example`, `.env.sample`, and
+access. This tracking rule asks Git only for tracked path names. Separate production
+configuration checks inspect allowlisted dotenv files locally; values are never
+reported. Sanitized `.env.example`, `.env.sample`, and
 `.env.template` files are allowed.
 
 ## Remediation

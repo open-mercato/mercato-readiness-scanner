@@ -11,3 +11,5 @@ coverage/
 !.env.template
 report.json
 report.md
+reports/
+*.tgz

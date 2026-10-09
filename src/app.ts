@@ -1,6 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { collectCiText, collectDeploymentText, existsInside, gitTrackedFiles, readSafeText } from './files.js'
+import { collectCiText, collectDeploymentText, existsInside, gitTrackedFiles, inspectPermissions, inspectStoragePermissions, readSafeText } from './files.js'
+import { loadEnvironment } from './environment.js'
 import type { ScanContext } from './types.js'
 
 function readPackageJson(directory: string): Record<string, unknown> | null {
@@ -43,13 +44,16 @@ export function findAppRoot(start: string): string | null {
   }
 }
 
-export function createScanContext(root: string): ScanContext {
+export function createScanContext(root: string, inherited: Readonly<Record<string, string | undefined>> = process.env): ScanContext {
   const packageJson = readPackageJson(root)
   if (!packageJson) throw new Error('The Open Mercato app package.json could not be read.')
   return {
     root,
     packageJson,
     trackedFiles: gitTrackedFiles(root),
+    environment: loadEnvironment(root, (file) => inspectPermissions(root, file) !== null, inherited),
+    inspectPermissions: (file) => inspectPermissions(root, file),
+    inspectStoragePermissions: (location) => inspectStoragePermissions(root, location),
     exists: (relativePath) => existsInside(root, relativePath),
     readText: (relativePath) => readSafeText(root, relativePath),
     collectDeploymentText: () => collectDeploymentText(root),

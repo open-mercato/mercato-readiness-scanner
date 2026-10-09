@@ -3,7 +3,22 @@ import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 
-const FILES: Record<string, string> = {
+// Synthetic test values, never actual service credentials.
+export const PRODUCTION_ENV: Readonly<Record<string, string>> = {
+  NODE_ENV: 'production',
+  APP_URL: 'https://shop.test.invalid',
+  APP_ALLOWED_ORIGINS: 'https://shop.test.invalid',
+  RATE_LIMIT_TRUST_PROXY_DEPTH: '1',
+  JWT_SECRET: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+  TENANT_DATA_ENCRYPTION: 'yes',
+  TENANT_DATA_ENCRYPTION_FALLBACK_KEY: 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789',
+  DATABASE_URL: 'postgresql://app:0123456789abcdef0123456789abcdef@db.test.invalid/app',
+  REDIS_URL: 'rediss://app:abcdef0123456789abcdef0123456789@cache.test.invalid:6379',
+  TELEMETRY_BACKEND: 'noop',
+  OTEL_TRACES_EXPORTER: 'none',
+}
+
+export const FILES: Readonly<Record<string, string>> = {
   'package.json': JSON.stringify({
     name: 'readiness-fixture',
     private: true,
@@ -68,7 +83,7 @@ const FILES: Record<string, string> = {
     'Use TLS and HTTPS with certificate renewal and the canonical origin.',
     'Use a persistent volume for uploads and storage.',
     'Run database migrate once, then supervise each queue worker.',
-    'Back up the database and files and rehearse restore in isolation.',
+    'Create database and file backups and rehearse restore in isolation.',
     'Keep the prior artifact and rehearse rollback or forward-fix procedures.',
   ].join('\n'),
   'yarn.lock': '# fixture lockfile\n',

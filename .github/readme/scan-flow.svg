@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="240" viewBox="0 0 1100 240" role="img" aria-labelledby="title desc">
+  <title id="title">Open Mercato readiness scan</title>
+  <desc id="desc">Read application configuration, production environment and file permissions. Run 36 readiness rules. Save reports and gate deployment.</desc>
+  <rect width="1100" height="240" rx="24" fill="#1b1b1b"/>
+  <g font-family="system-ui, -apple-system, sans-serif">
+    <rect x="28" y="32" width="318" height="176" rx="16" fill="#272727" stroke="#484848"/>
+    <text x="52" y="69" fill="#b4f372" font-size="13" font-weight="700" letter-spacing="1.5">YOUR APP</text>
+    <text x="52" y="103" fill="#ffffff" font-size="19" font-weight="650">Configuration + environment</text>
+    <text x="52" y="136" fill="#c6c6c6" font-size="16">Production .env + process variables</text>
+    <text x="52" y="163" fill="#c6c6c6" font-size="16">Repository + file permissions</text>
+    <text x="52" y="190" fill="#c6c6c6" font-size="14">Read-only checks</text>
+    <path d="M360 120h26m-7-7 7 7-7 7" fill="none" stroke="#b4f372" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="400" y="32" width="300" height="176" rx="16" fill="#b4f372"/>
+    <text x="424" y="69" fill="#1b1b1b" font-size="13" font-weight="700" letter-spacing="1.5">READINESS SCANNER</text>
+    <text x="424" y="105" fill="#1b1b1b" font-size="26" font-weight="700">36 documented rules</text>
+    <text x="424" y="139" fill="#303627" font-size="16">Secrets, encryption, services</text>
+    <text x="424" y="166" fill="#303627" font-size="16">Storage, tracing, deployment</text>
+    <text x="424" y="190" fill="#303627" font-size="14">Choose rules with --only / --ignore</text>
+    <path d="M714 120h26m-7-7 7 7-7 7" fill="none" stroke="#bc9aff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="754" y="32" width="318" height="176" rx="16" fill="#272727" stroke="#484848"/>
+    <text x="778" y="69" fill="#bc9aff" font-size="13" font-weight="700" letter-spacing="1.5">YOUR REPORT</text>
+    <text x="778" y="103" fill="#ffffff" font-size="19" font-weight="650">Terminal + Markdown + JSON</text>
+    <text x="778" y="136" fill="#c6c6c6" font-size="16">Rule IDs + remediation guides</text>
+    <text x="778" y="163" fill="#c6c6c6" font-size="16">CI gate with --fail-on high</text>
+    <text x="778" y="190" fill="#c6c6c6" font-size="14">Secret values stay out of reports</text>
+  </g>
+</svg>

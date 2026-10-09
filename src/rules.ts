@@ -1,4 +1,5 @@
 import { isLiveEnvPath } from './files.js'
+import { SECURITY_RULES } from './security-rules.js'
 import type { RuleCheck, RuleDefinition, ScanContext, Severity } from './types.js'
 
 const DOCS_BASE = 'https://github.com/open-mercato/mercato-readiness-scanner/blob/main/docs/rules'
@@ -69,6 +70,7 @@ function fileEvidence(paths: string[]): string[] {
 }
 
 function displayPath(value: string): string {
+  // eslint-disable-next-line no-control-regex -- strip control characters from untrusted paths
   return value.replace(/[\u0000-\u001F\u007F]/g, '?').slice(0, 240)
 }
 
@@ -94,7 +96,7 @@ function composePublicBindings(context: ScanContext): string[] {
     let service: string | null = null
     let portsIndent = -1
     for (const line of lines) {
-      const serviceMatch = line.match(/^  ([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)
+      const serviceMatch = line.match(/^ {2}([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)
       if (serviceMatch?.[1]) {
         service = serviceMatch[1]
         portsIndent = -1
@@ -110,7 +112,7 @@ function composePublicBindings(context: ScanContext): string[] {
       if (portsIndent < 0) continue
       const binding = line.match(/^\s+-\s*["']?([^"'#]+)["']?/)?.[1]?.trim()
       if (!binding || /^(?:127\.0\.0\.1|localhost):/.test(binding)) continue
-      findings.push(`${file}: ${service} publishes ${displayPath(binding)}`)
+      findings.push(`${file}: a recognized stateful service publishes a non-loopback host port.`)
     }
   }
   return findings
@@ -122,7 +124,7 @@ function workerDockerfiles(context: ScanContext): string[] {
     const source = context.readText(file)
     if (!source) continue
     const configured = source.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1]
-    values.push(configured ? displayPath(configured) : 'Dockerfile')
+    values.push(configured ?? 'Dockerfile')
   }
   return values
 }
@@ -133,7 +135,7 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Remove value-bearing .env files from version control, rotate exposed credentials, and keep only sanitized example/sample/template files.',
     check: (context) => {
       if (!context.trackedFiles) return { status: 'warning', summary: 'Git tracking could not be inspected; verify that no live environment file is committed.' }
-      const tracked = [...context.trackedFiles].filter(isLiveEnvPath)
+      const tracked = [...context.trackedFiles].filter(isLiveEnvPath).sort()
       return tracked.length === 0
         ? { status: 'pass', summary: 'No value-bearing .env file is tracked.' }
         : { status: 'fail', summary: 'Value-bearing environment files are tracked.', evidence: tracked.map((file) => `Tracked sensitive path: ${displayPath(file)}`) }
@@ -144,7 +146,7 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Remove tracked credential or private-key files, revoke or rotate the material, and store it in an access-controlled secret manager.',
     check: (context) => {
       if (!context.trackedFiles) return { status: 'warning', summary: 'Git tracking could not be inspected; verify that no credential or private-key file is committed.' }
-      const tracked = [...context.trackedFiles].filter(trackedCredentialPath)
+      const tracked = [...context.trackedFiles].filter(trackedCredentialPath).sort()
       return tracked.length
         ? { status: 'fail', summary: 'Credential-like or private-key paths are tracked.', evidence: tracked.map((file) => `Tracked sensitive path: ${displayPath(file)}`) }
         : { status: 'pass', summary: 'No recognized credential or private-key path is tracked.' }
@@ -318,10 +320,10 @@ export const RULES: readonly RuleDefinition[] = [
       const images = [...source.matchAll(/^\s*image\s*[:=]\s*["']?([^\s"']+)/gmi)].map((match) => match[1] ?? '')
       if (!images.length) return { status: 'warning', summary: 'No in-repository production image reference proves immutable artifact selection.' }
       const mutable = images.filter((image) => /:latest$|:(?:main|master|develop|dev)$/i.test(image))
-      if (mutable.length) return { status: 'fail', summary: 'Production configuration uses mutable image references.', evidence: mutable.map((image) => `Mutable image reference: ${displayPath(image)}`) }
+      if (mutable.length) return { status: 'fail', summary: 'Production configuration uses mutable image references.', evidence: ['A recognized deployment file selects a mutable image tag.'] }
       const unpinned = images.filter((image) => !/@sha256:[a-f0-9]{64}$/i.test(image) && !/:[a-f0-9]{7,40}$/i.test(image) && !/github\.sha/i.test(image))
       return unpinned.length
-        ? { status: 'warning', summary: 'Image references exist, but the scanner cannot prove they are immutable.', evidence: unpinned.map((image) => `Review image reference: ${displayPath(image)}`) }
+        ? { status: 'warning', summary: 'Image references exist, but the scanner cannot prove they are immutable.', evidence: ['A recognized deployment file selects an image without a digest or commit identifier.'] }
         : { status: 'pass', summary: 'Production image references use a digest or commit-derived identifier.' }
     },
   }),
@@ -363,8 +365,8 @@ export const RULES: readonly RuleDefinition[] = [
       const dockerfiles = workerDockerfiles(context)
       if (dockerfiles.length < 2) return { status: 'warning', summary: 'Worker deployment exists, but artifact parity is controlled outside recognized repository files.' }
       return new Set(dockerfiles).size === 1
-        ? { status: 'pass', summary: 'Web and worker deployment definitions use the same Dockerfile.', evidence: [`Shared build definition: ${dockerfiles[0]}`] }
-        : { status: 'fail', summary: 'Web and worker deployment definitions use different build artifacts.', evidence: dockerfiles.map((file) => `Build definition: ${file}`) }
+        ? { status: 'pass', summary: 'Web and worker deployment definitions use the same Dockerfile.', evidence: ['railway.toml and railway.worker.toml select the same Dockerfile path.'] }
+        : { status: 'fail', summary: 'Web and worker deployment definitions use different build artifacts.', evidence: ['railway.toml and railway.worker.toml select different Dockerfile paths.'] }
     },
   }),
   rule({
@@ -431,4 +433,5 @@ export const RULES: readonly RuleDefinition[] = [
         : { status: 'fail', summary: 'Development-only switches default to enabled.', evidence: risky.map((key) => `Enabled template switch: ${key}`) }
     },
   }),
+  ...SECURITY_RULES,
 ] as const

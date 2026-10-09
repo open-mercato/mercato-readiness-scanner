@@ -14,6 +14,7 @@ function run(args: string[]) {
   return spawnSync(process.execPath, ['--import', 'tsx', cli, ...args], {
     cwd: repositoryRoot,
     encoding: 'utf8',
+    env: Object.fromEntries(Object.entries(process.env).filter(([key]) => ['PATH', 'SYSTEMROOT', 'TMPDIR', 'TEMP', 'TMP', 'HOME'].includes(key))),
   })
 }
 
@@ -93,4 +94,24 @@ test('help works outside an app and diagnostics use distinct exit codes', () => 
   } finally {
     removeFixture(root)
   }
+})
+
+test('lists rule IDs and applies repeatable only/ignore selection before failure thresholds', () => {
+  const listing = run(['--list-rules'])
+  assert.equal(listing.status, 0)
+  for (const rule of RULES) assert.ok(listing.stdout.includes(`${rule.id}\t`))
+  const root = makeAppFixture()
+  try {
+    const selected = run([root, '--only', 'secrets-jwt-signing,data-tenant-encryption-enabled', '--ignore', 'secrets-jwt-signing', '--ignore', 'data-tenant-encryption-enabled', '--fail-on', 'low', '--format', 'json'])
+    assert.equal(selected.status, 0, selected.stderr)
+    const report = JSON.parse(selected.stdout) as { results: { status: string }[] }
+    assert.ok(report.results.every(({ status }) => status === 'skipped'))
+    const failing = run([root, '--only', 'secrets-jwt-signing', '--fail-on', 'critical', '--format', 'json'])
+    assert.equal(failing.status, 1)
+    const unknown = run([root, '--ignore', 'secrets-jwt-singing'])
+    assert.equal(unknown.status, 2)
+    assert.match(unknown.stderr, /Unknown rule ID/)
+    const empty = run([root, '--only', ','])
+    assert.equal(empty.status, 2)
+  } finally { removeFixture(root) }
 })

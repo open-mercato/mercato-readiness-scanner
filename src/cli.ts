@@ -3,7 +3,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import { formatJson, formatMarkdown, formatTerminal } from './formatters.js'
-import { InvalidTargetError, scan, VERSION } from './scan.js'
+import { InvalidRuleSelectionError, InvalidTargetError, scan, VERSION } from './scan.js'
+import { RULES } from './rules.js'
 import type { ScanReport, Severity } from './types.js'
 
 type Format = 'terminal' | 'markdown' | 'json'
@@ -16,6 +17,8 @@ type Options = {
   json?: string
   color: boolean
   failOn: Severity | 'never'
+  ignoreRules: string[]
+  onlyRules?: string[]
 }
 
 class CliUsageError extends Error {
@@ -38,6 +41,9 @@ Options:
                                     return exit 1 when a failed rule meets the threshold
                                     (default: never)
   --no-color                        disable ANSI colors
+  --ignore <rule-id,...>            skip selected rules (repeatable)
+  --only <rule-id,...>              run only selected rules (repeatable)
+  --list-rules                     list stable rule IDs without scanning
   --help                            show help
   --version                         show version
 
@@ -54,12 +60,13 @@ function takeValue(args: string[], index: number, flag: string, allowDash = fals
   return value
 }
 
-function parseArgs(argv: string[]): Options | 'help' | 'version' {
+function parseArgs(argv: string[]): Options | 'help' | 'version' | 'rules' {
   const args = [...argv]
   if (args[0] === 'scan') args.shift()
   if (args.includes('--help') || args.includes('-h')) return 'help'
   if (args.includes('--version') || args.includes('-v')) return 'version'
-  const options: Options = { start: '.', format: 'terminal', formatExplicit: false, color: process.stdout.isTTY, failOn: 'never' }
+  if (args.includes('--list-rules')) return 'rules'
+  const options: Options = { start: '.', format: 'terminal', formatExplicit: false, color: process.stdout.isTTY, failOn: 'never', ignoreRules: [] }
   for (let index = 0; index < args.length;) {
     const token = args[index]
     if (token === '--no-color') { options.color = false; args.splice(index, 1); continue }
@@ -73,6 +80,14 @@ function parseArgs(argv: string[]): Options | 'help' | 'version' {
     if (token === '--output') { options.output = takeValue(args, index, token, true); continue }
     if (token === '--markdown') { options.markdown = takeValue(args, index, token); continue }
     if (token === '--json') { options.json = takeValue(args, index, token); continue }
+    if (token === '--ignore' || token === '--only') {
+      const value = takeValue(args, index, token)
+      const ids = value.split(',').map((id) => id.trim())
+      if (ids.some((id) => !id)) throw new CliUsageError(`${token} requires non-empty rule IDs.`)
+      if (token === '--ignore') options.ignoreRules.push(...ids)
+      else options.onlyRules = [...options.onlyRules ?? [], ...ids]
+      continue
+    }
     if (token === '--fail-on') {
       const value = takeValue(args, index, token)
       if (!['critical', 'high', 'medium', 'low', 'never'].includes(value)) throw new CliUsageError(`Unsupported fail threshold: ${value}`)
@@ -116,7 +131,8 @@ export function main(argv = process.argv.slice(2)): number {
     const parsed = parseArgs(argv)
     if (parsed === 'help') { fs.writeSync(process.stdout.fd, HELP); return 0 }
     if (parsed === 'version') { fs.writeSync(process.stdout.fd, `${VERSION}\n`); return 0 }
-    const report = scan(parsed.start)
+    if (parsed === 'rules') { fs.writeSync(process.stdout.fd, `${RULES.map((rule) => `${rule.id}\t${rule.severity}\t${rule.title}`).join('\n')}\n`); return 0 }
+    const report = scan(parsed.start, { ignoreRules: parsed.ignoreRules, ...(parsed.onlyRules === undefined ? {} : { onlyRules: parsed.onlyRules }) })
     const stdout = render(report, parsed.format, parsed.color)
     if (!parsed.output || parsed.output === '-') fs.writeSync(process.stdout.fd, stdout)
     else writeReport(parsed.output, stdout)
@@ -128,8 +144,9 @@ export function main(argv = process.argv.slice(2)): number {
     try {
       fs.writeSync(process.stderr.fd, `mercato-readiness: ${message}\n`)
     } catch {
+      // A closed stderr must not replace the scanner's exit code.
     }
-    return error instanceof CliUsageError || error instanceof InvalidTargetError ? 2 : 3
+    return error instanceof CliUsageError || error instanceof InvalidTargetError || error instanceof InvalidRuleSelectionError ? 2 : 3
   }
 }
 

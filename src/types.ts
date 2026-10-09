@@ -1,3 +1,6 @@
+import type { Environment } from './environment.js'
+import type { PermissionInspection, StorageInspection } from './files.js'
+
 export type Severity = 'critical' | 'high' | 'medium' | 'low'
 export type FindingStatus = 'pass' | 'fail' | 'warning' | 'skipped'
 
@@ -43,6 +46,9 @@ export type ScanContext = {
   root: string
   packageJson: Record<string, unknown>
   trackedFiles: ReadonlySet<string> | null
+  environment: Environment
+  inspectPermissions: (relativePath: string) => PermissionInspection | null
+  inspectStoragePermissions: (location: string) => StorageInspection | null
   exists: (relativePath: string) => boolean
   readText: (relativePath: string) => string | null
   collectDeploymentText: () => string
