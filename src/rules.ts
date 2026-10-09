@@ -292,38 +292,46 @@ function workerArtifactParity(context: ScanContext): ArtifactParity {
       const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
       return isWorkerCommand(command)
     })
-    const web = services.find(([name, value]) => {
+    const webs = services.filter(([name, value]) => {
       const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
       return !isWorkerCommand(command) && /^(?:app|web|mercato)$/i.test(name)
     })
     if (!workers.length) {
-      if (web && workerDefinitions(context).length > 0) {
-        const webArtifact = composeArtifact(web[1])
-        if (webArtifact) {
-          evidence.push(`${file} web artifact: ${displayPath(webArtifact)}`)
+      if (webs.length > 0 && workerDefinitions(context).length > 0) {
+        for (const [name, value] of webs) {
+          const webArtifact = composeArtifact(value)
+          if (!webArtifact) {
+            complete = false
+            continue
+          }
+          evidence.push(`${file} ${displayPath(name)} artifact: ${displayPath(webArtifact)}`)
           const kind = webArtifact.split(':', 1)[0] ?? ''
           const known = comparableArtifacts.get(kind) ?? new Set<string>()
           known.add(webArtifact)
           comparableArtifacts.set(kind, known)
-        } else complete = false
+        }
       }
       continue
     }
-    if (!web) {
+    if (!webs.length) {
       complete = false
       continue
     }
-    const webArtifact = composeArtifact(web[1])
-    if (!webArtifact) complete = false
+    const webArtifacts = webs.map(([name, value]) => ({ name, artifact: composeArtifact(value) }))
+    if (webArtifacts.some(({ artifact }) => !artifact)) complete = false
     for (const [name, value] of workers) {
       const workerArtifact = composeArtifact(value)
-      if (!workerArtifact || !webArtifact) {
+      if (!workerArtifact) {
         complete = false
         continue
       }
-      evidence.push(`${file} web artifact: ${displayPath(webArtifact)}`, `${file} ${displayPath(name)} artifact: ${displayPath(workerArtifact)}`)
-      if (webArtifact !== workerArtifact) mismatch = true
-      for (const artifact of [webArtifact, workerArtifact]) {
+      evidence.push(`${file} ${displayPath(name)} artifact: ${displayPath(workerArtifact)}`)
+      for (const { name: webName, artifact: webArtifact } of webArtifacts) {
+        if (!webArtifact) continue
+        evidence.push(`${file} ${displayPath(webName)} artifact: ${displayPath(webArtifact)}`)
+        if (webArtifact !== workerArtifact) mismatch = true
+      }
+      for (const artifact of [...webArtifacts.map(({ artifact }) => artifact).filter((value): value is string => value !== null), workerArtifact]) {
         const kind = artifact.split(':', 1)[0] ?? ''
         const known = comparableArtifacts.get(kind) ?? new Set<string>()
         known.add(artifact)
@@ -429,26 +437,31 @@ function dependencyMutation(command: string): DependencyMutation | null {
     .replace(/^(?:RUN|CMD|ENTRYPOINT)\s+/i, '')
     .replace(/^[A-Za-z][\w.-]*(?:Command|command)\s*=\s*["']?/i, '')
     .replace(/^["']/, '')
+    .replace(/^[({]+\s*/, '')
+    .replace(/^(?:exec\s+|sudo\s+|env\s+|corepack\s+)+/i, '')
+    .replace(/^(?:(?:[A-Za-z_][A-Za-z0-9_]*)=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)+/, '')
     .replace(/^(?:exec\s+|sudo\s+|corepack\s+)+/i, '')
     .trim()
   const match = normalized.match(/^(npm|yarn|pnpm)\s+([^\s"']+)([^\n]*)/i)
-  if (!match?.[1] || !match[2]) return null
+  if (!match?.[1] || !match[2]) {
+    return /\b(?:npm|yarn|pnpm)\b[^\n;&|]*\b(?:ci|install|i|add|update|up|upgrade)\b/i.test(normalized) ? 'mutable' : null
+  }
   const manager = match[1].toLowerCase()
   const action = match[2].toLowerCase()
   const args = match[3] ?? ''
   if (manager === 'npm') {
     if (action === 'ci') return 'immutable'
     if (['install', 'i', 'add', 'update', 'up'].includes(action)) return 'mutable'
-    return null
+    return /\b(?:ci|install|i|add|update|up)\b/i.test(`${action}${args}`) ? 'mutable' : null
   }
   if (manager === 'yarn') {
     if (action === 'install') return /(?:^|\s)--(?:immutable|frozen-lockfile)(?:\s|$)/i.test(args) ? 'immutable' : 'mutable'
     if (['add', 'update', 'up', 'upgrade'].includes(action)) return 'mutable'
-    return null
+    return /\b(?:install|add|update|up|upgrade)\b/i.test(`${action}${args}`) ? 'mutable' : null
   }
   if (action === 'install' || action === 'i') return /(?:^|\s)--frozen-lockfile(?:\s|$)/i.test(args) ? 'immutable' : 'mutable'
   if (['add', 'update', 'up'].includes(action)) return 'mutable'
-  return null
+  return /\b(?:install|i|add|update|up)\b/i.test(`${action}${args}`) ? 'mutable' : null
 }
 
 function dependencyInstallationProof(context: ScanContext): { found: boolean, mutableSurfaces: string[] } {
@@ -493,17 +506,18 @@ function extractDelimitedBody(source: string, openingIndex: number, opening: str
   return null
 }
 
-function activeHeaderEvidence(source: string): string {
+function activeHeaderEntries(source: string): Map<string, string> {
+  const entries = new Map<string, string>()
   const functionMatch = /(?:async\s+)?headers\s*\(\s*\)\s*\{|headers\s*:\s*(?:async\s*)?(?:function\s*\([^)]*\)|\([^)]*\)\s*=>)\s*\{/m.exec(source)
-  if (!functionMatch) return ''
+  if (!functionMatch) return entries
   const openingBrace = source.indexOf('{', functionMatch.index)
   const body = extractDelimitedBody(source, openingBrace, '{', '}')
-  if (!body) return ''
+  if (!body) return entries
   const returned = /\breturn\s*\[/m.exec(body)
-  if (!returned) return ''
+  if (!returned) return entries
   const openingBracket = body.indexOf('[', returned.index)
   const returnedEntries = extractDelimitedBody(body, openingBracket, '[', ']')
-  if (!returnedEntries) return ''
+  if (!returnedEntries) return entries
   const evidence = [returnedEntries]
   for (const match of returnedEntries.matchAll(/\bheaders\s*:\s*([A-Za-z_$][\w$]*)\b/g)) {
     const identifier = match[1]
@@ -511,7 +525,11 @@ function activeHeaderEvidence(source: string): string {
     const declaration = new RegExp(`(?:const|let|var)\\s+${identifier.replace(/[$]/g, '\\$&')}\\s*=\\s*\\[([\\s\\S]*?)\\]`, 'm').exec(source)
     if (declaration?.[0]) evidence.push(declaration[0])
   }
-  return evidence.join('\n')
+  for (const object of evidence.join('\n').match(/\{[^{}]*\}/g) ?? []) {
+    const key = object.match(/\bkey\s*:\s*["']([^"']+)["']/)?.[1]
+    if (key && /\bvalue\s*:/.test(object)) entries.set(key, object)
+  }
+  return entries
 }
 
 function requiresNode24OrNewer(range: string): boolean {
@@ -624,11 +642,12 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Keep the shared CSP and security headers in next.config.ts and verify that the public edge preserves them.',
     check: (context) => {
       const source = uncommented(context.readText('next.config.ts') ?? context.readText('next.config.mjs') ?? '')
-      const activeHeaders = activeHeaderEvidence(source)
+      const activeHeaders = activeHeaderEntries(source)
       const required = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options']
-      const missing = required.filter((header) => !activeHeaders.includes(header))
-      if (!/X-Frame-Options|frame-ancestors/.test(activeHeaders)) missing.push('frame protection')
-      if (!activeHeaders) missing.push('active Next.js headers configuration')
+      const missing = required.filter((header) => !activeHeaders.has(header))
+      const contentSecurityPolicy = activeHeaders.get('Content-Security-Policy') ?? ''
+      if (!activeHeaders.has('X-Frame-Options') && !/frame-ancestors/.test(contentSecurityPolicy)) missing.push('frame protection')
+      if (activeHeaders.size === 0) missing.push('active Next.js headers configuration')
       return missing.length
         ? { status: 'fail', summary: 'The application configuration does not declare the complete security-header baseline.', evidence: missing.map((header) => `Missing header: ${header}`) }
         : { status: 'pass', summary: 'The application declares CSP, referrer, frame, and MIME-sniffing protection headers.' }

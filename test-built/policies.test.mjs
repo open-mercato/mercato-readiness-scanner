@@ -22,7 +22,7 @@ function fixture(files = {}) {
     '.gitignore': '.env\n.env.production\n.env.local\n.env.*.local\n!.env.example\n*.pem\n*.key\n.mcp.json\n.npmrc\n.ai/session-exports/\n',
     'yarn.lock': '# lock\n',
     Dockerfile: 'FROM node:24\nRUN yarn install --immutable\nUSER app\n',
-    'next.config.ts': "const securityHeaders = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options', 'X-Frame-Options']\nexport default { async headers() { return [{ source: '/:path*', headers: securityHeaders }] } }\n",
+    'next.config.ts': 'const securityHeaders = [\n  { key: "Content-Security-Policy", value: "default-src self; frame-ancestors self" },\n  { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },\n  { key: "X-Content-Type-Options", value: "nosniff" },\n  { key: "X-Frame-Options", value: "SAMEORIGIN" },\n]\nexport default { async headers() { return [{ source: "/:path*", headers: securityHeaders }] } }\n',
     'railway.toml': '[deploy]\nhealthcheckPath = "/api/healthz"\nstartCommand = "yarn db:migrate && yarn start"\n',
     'railway.worker.toml': '[deploy]\nstartCommand = "yarn mercato worker"\n',
     'docker-compose.fullapp.yml': 'services:\n  app:\n    volumes: ["uploads:/app/storage"]\n',
@@ -129,6 +129,8 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
     overwrite(root, 'next.config.ts', 'const securityHeaders = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options", "X-Frame-Options"]\nexport default { async headers() { return []; const unused = { headers: securityHeaders } } }\n')
     assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
+    overwrite(root, 'next.config.ts', 'const securityHeaders = ["Content-Security-Policy", "Referrer-Policy", "X-Content-Type-Options", "X-Frame-Options"]\nexport default { async headers() { return [{ source: "/:path*", headers: securityHeaders }] } }\n')
+    assert.equal(scan(root).get('edge-security-headers')?.status, 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
     assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'fail')
@@ -136,6 +138,9 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
       'FROM node:24\nRUN npm ci; npm i\nUSER app\n',
       'FROM node:24\nRUN npm ci; npm update\nUSER app\n',
       'FROM node:24\nRUN npm install; echo npm ci\nUSER app\n',
+      'FROM node:24\nRUN npm ci; NODE_ENV=production npm install --omit=dev\nUSER app\n',
+      'FROM node:24\nRUN npm ci && (npm install --omit=dev)\nUSER app\n',
+      'FROM node:24\nRUN npm ci; npm --silent install\nUSER app\n',
     ]) {
       overwrite(root, 'Dockerfile', dockerfile)
       assert.equal(scan(root).get('supply-chain-immutable-install')?.status, 'fail', dockerfile)
@@ -150,6 +155,9 @@ test('built CLI evaluates effective policies and rejects non-proof text', () => 
     overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    image: app:two\n  worker:\n    image: app:two\n    command: yarn mercato worker\n')
     assert.equal(scan(root).get('workers-release-parity')?.status, 'fail')
     overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:three\n')
+    assert.equal(scan(root).get('workers-release-parity')?.status, 'fail')
+    overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:1111111\n  web:\n    image: app:2222222\n  worker:\n    image: app:1111111\n    command: yarn mercato worker\n')
+    overwrite(root, 'docker-compose.fullapp.yml', '')
     assert.equal(scan(root).get('workers-release-parity')?.status, 'fail')
 
     const safeTemplate = 'NODE_ENV=production\nAPP_URL=https://example.com\nDATABASE_URL=\nINTERNAL_APP_ORIGIN=\nPLATFORM_PRIMARY_HOST=\nRATE_LIMIT_TRUST_PROXY_DEPTH=1\nAPP_ALLOWED_ORIGINS=https://example.com\nCACHE_STRATEGY=redis\nREDIS_URL=\n'
