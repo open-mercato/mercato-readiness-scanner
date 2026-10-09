@@ -3,7 +3,7 @@ import { parseEnv } from 'node:util'
 import { minVersion, validRange } from 'semver'
 import { parse, parseAllDocuments } from 'yaml'
 import { isCredentialPath, isLiveEnvPath } from './files.js'
-import type { RuleCheck, RuleDefinition, ScanContext, Severity } from './types.js'
+import type { AutofixAction, AutofixDescriptor, RuleCheck, RuleDefinition, ScanContext, Severity } from './types.js'
 
 const DOCS_BASE = 'https://github.com/open-mercato/mercato-readiness-scanner/blob/main/docs/rules'
 
@@ -13,12 +13,72 @@ type RuleInput = {
   category: string
   severity: Severity
   remediation: string
+  autofix: AutofixDescriptor
   check: (context: ScanContext) => RuleCheck
 }
 
 function rule(input: RuleInput): RuleDefinition {
   return { ...input, docsUrl: `${DOCS_BASE}/${input.id}.md` }
 }
+
+function manual(reason: string): AutofixDescriptor {
+  return { safety: 'manual-only', reason }
+}
+
+export const REQUIRED_IGNORE_PATTERNS = ['.env', '.env.production', '.env.local', '.env.*.local', '*.pem', '*.key', '.mcp.json', '.npmrc', '.ai/session-exports/'] as const
+
+const IGNORE_FILE_HEADER = ['# Sensitive local artifacts (added by mercato-readiness apply).', '# Review and extend this policy for the artifacts your team keeps locally.'] as const
+
+const BACKUP_RUNBOOK_PATH = 'docs/runbooks/backup-and-restore.md'
+const ROLLBACK_RUNBOOK_PATH = 'docs/runbooks/rollback-and-forward-fix.md'
+
+const BACKUP_RUNBOOK_STUB = [
+  '# Backup and restore runbook',
+  '',
+  '> Stub created by `mercato-readiness apply`. Every TODO below still needs an owner,',
+  '> a real value, and a dated rehearsal. Until then this runbook documents intent only.',
+  '',
+  '## Database backup',
+  '',
+  '- TODO: backup mechanism and schedule (provider snapshot, `pg_dump`, WAL archiving).',
+  '- TODO: retention window and where retention is enforced.',
+  '- TODO: encryption at rest and in transit for the backup copies.',
+  '- TODO: off-site or cross-region copy location.',
+  '',
+  '## File and object storage backup',
+  '',
+  '- TODO: which upload and document paths are covered.',
+  '- TODO: backup mechanism, schedule, and retention for those paths.',
+  '',
+  '## Restore',
+  '',
+  '- TODO: named owner accountable for restores.',
+  '- TODO: step-by-step restore procedure into an isolated environment.',
+  '- TODO: recovery point and recovery time objectives.',
+  '- TODO: date and outcome of the last successful restore rehearsal.',
+  '',
+].join('\n')
+
+const ROLLBACK_RUNBOOK_STUB = [
+  '# Rollback and forward-fix runbook',
+  '',
+  '> Stub created by `mercato-readiness apply`. Every TODO below still needs an owner,',
+  '> a real value, and a rehearsal against the actual provider.',
+  '',
+  '## Rollback',
+  '',
+  '- TODO: how the previous immutable artifact is selected (digest or commit SHA).',
+  '- TODO: exact provider commands or console steps to redeploy it.',
+  '- TODO: database compatibility constraints that make a rollback unsafe.',
+  '- TODO: how a completed rollback is verified (health check, smoke test, dashboards).',
+  '',
+  '## Forward fix',
+  '',
+  '- TODO: when a forward fix is preferred over a rollback.',
+  '- TODO: named owner and escalation path.',
+  '- TODO: date and outcome of the last rollback rehearsal.',
+  '',
+].join('\n')
 
 function scripts(context: ScanContext): Record<string, string> {
   const value = context.packageJson.scripts
@@ -83,6 +143,11 @@ function displayPath(value: string): string {
 function ignorePatterns(context: ScanContext): ReadonlySet<string> {
   const source = context.readText('.gitignore') ?? ''
   return new Set(source.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#')))
+}
+
+function missingIgnorePatterns(context: ScanContext): string[] {
+  const patterns = ignorePatterns(context)
+  return REQUIRED_IGNORE_PATTERNS.filter((pattern) => !patterns.has(pattern))
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -676,6 +741,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'secrets-live-env-untracked', title: 'Live environment files are not tracked', category: 'Secrets', severity: 'critical',
     remediation: 'Remove value-bearing .env files from version control, rotate exposed credentials, and keep only sanitized example/sample/template files.',
+    autofix: manual('Removing history and rotating leaked credentials destroys data and needs operator decisions; the scanner never touches value-bearing .env files.'),
     check: (context) => {
       if (!context.trackedFiles) return { status: 'warning', summary: 'Git tracking could not be inspected; verify that no live environment file is committed.' }
       const tracked = [...context.trackedFiles].filter(isLiveEnvPath)
@@ -687,6 +753,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'secrets-no-tracked-credentials', title: 'Credential and private-key files are not tracked', category: 'Secrets', severity: 'critical',
     remediation: 'Remove tracked credential or private-key files, revoke or rotate the material, and store it in an access-controlled secret manager.',
+    autofix: manual('Revoking key material and deleting tracked secrets is destructive and irreversible; it must be done by an operator who can rotate the credential.'),
     check: (context) => {
       if (!context.trackedFiles) return { status: 'warning', summary: 'Git tracking could not be inspected; verify that no credential or private-key file is committed.' }
       const tracked = [...context.trackedFiles].filter(isCredentialPath)
@@ -698,11 +765,22 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'secrets-ignore-policy', title: 'Sensitive local files are ignored', category: 'Secrets', severity: 'high',
     remediation: 'Ignore live .env files, private keys, local MCP credentials, npm credentials, and raw agent session exports.',
+    autofix: {
+      safety: 'safe-additive',
+      summary: 'Append the missing ignore patterns to .gitignore, or create .gitignore when it is absent.',
+      plan: (context) => {
+        const missing = missingIgnorePatterns(context)
+        if (!missing.length) return []
+        if (!context.exists('.gitignore')) {
+          return [{ kind: 'create-file', path: '.gitignore', contents: `${[...IGNORE_FILE_HEADER, ...missing].join('\n')}\n`, description: `create .gitignore with ${missing.length} sensitive-artifact pattern(s)` }]
+        }
+        return [{ kind: 'append-lines', path: '.gitignore', lines: missing, description: `append ${missing.length} missing ignore pattern(s): ${missing.join(', ')}` }]
+      },
+    },
     check: (context) => {
       const patterns = ignorePatterns(context)
       if (!patterns.size) return { status: 'fail', summary: 'No readable .gitignore defines a sensitive-file policy.' }
-      const required = ['.env', '.env.production', '.env.local', '.env.*.local', '*.pem', '*.key', '.mcp.json', '.npmrc', '.ai/session-exports/']
-      const missing = required.filter((pattern) => !patterns.has(pattern))
+      const missing = missingIgnorePatterns(context)
       return missing.length === 0
         ? { status: 'pass', summary: 'The ignore policy covers common Open Mercato secret and session artifacts.' }
         : { status: 'fail', summary: 'The ignore policy misses sensitive local artifacts.', evidence: missing.map((pattern) => `Missing ignore coverage: ${pattern}`) }
@@ -711,6 +789,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'runtime-env-template', title: 'Production configuration has a sanitized template', category: 'Runtime', severity: 'high',
     remediation: 'Keep a sanitized .env.example with configuration names and safe placeholders for the exact app release.',
+    autofix: manual('The apply mode never writes any .env* file. A generated placeholder would also be a guess: the correct names and defaults belong to the exact app release.'),
     check: (context) => {
       if (!context.exists('.env.example')) return { status: 'fail', summary: 'The application has no .env.example template.' }
       const inventory = templateInventory(context)
@@ -723,6 +802,17 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'runtime-production-scripts', title: 'Production build and start scripts are explicit', category: 'Runtime', severity: 'high',
     remediation: 'Define failure-preserving production build and start scripts, force NODE_ENV=production during the build, and never use a development server for production.',
+    autofix: {
+      safety: 'safe-additive',
+      summary: 'Insert a missing build or start script key into package.json. An existing script value is never rewritten.',
+      plan: (context) => {
+        const values = scripts(context)
+        const actions: AutofixAction[] = []
+        if (!values.build) actions.push({ kind: 'add-npm-script', name: 'build', value: 'NODE_ENV=production next build', description: 'add the missing "build" script (adjust the build command to your toolchain)' })
+        if (!values.start) actions.push({ kind: 'add-npm-script', name: 'start', value: 'mercato server start', description: 'add the missing "start" script' })
+        return actions
+      },
+    },
     check: (context) => {
       const values = scripts(context)
       const missing = ['build', 'start'].filter((name) => !values[name])
@@ -741,6 +831,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'edge-tls-and-canonical-origin', title: 'TLS and canonical origin are verified at deployment', category: 'Edge', severity: 'critical',
     remediation: 'Serve every public route over HTTPS, redirect HTTP, verify certificate renewal, and set the canonical public origin to the real HTTPS URL.',
+    autofix: manual('The remediation is live edge and DNS configuration, not a file the scanner can add. Writing a document would hide an unverified production risk.'),
     check: (context) => {
       const source = context.collectDeploymentText()
       const hasTlsRunbook = /\b(?:https|tls|certificate)\b/i.test(source)
@@ -752,6 +843,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'edge-trusted-proxy-depth', title: 'Trusted proxy depth is topology-specific', category: 'Edge', severity: 'high',
     remediation: 'Set RATE_LIMIT_TRUST_PROXY_DEPTH to the exact number of trusted proxy hops and never trust arbitrary forwarded headers.',
+    autofix: manual('The apply mode never writes any .env* file, and the correct hop count is a property of the deployed proxy chain. A guessed depth is a rate-limit bypass.'),
     check: (context) => {
       const inventory = templateInventory(context)
       if (!inventory.names.has('RATE_LIMIT_TRUST_PROXY_DEPTH')) return { status: 'fail', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH is absent from the configuration template.' }
@@ -763,6 +855,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'edge-allowed-origins', title: 'Browser and real-time origins are restricted', category: 'Edge', severity: 'high',
     remediation: 'Configure APP_ALLOWED_ORIGINS and capability-specific origin lists with only intended HTTPS origins.',
+    autofix: manual('The apply mode never writes any .env* file, and only the operator knows which origins are intended. A guessed allowlist is a cross-origin vulnerability.'),
     check: (context) => {
       const inventory = templateInventory(context)
       const required = ['APP_ALLOWED_ORIGINS']
@@ -778,6 +871,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'edge-security-headers', title: 'Application security headers are configured', category: 'Edge', severity: 'high',
     remediation: 'Keep the shared CSP and security headers in next.config.ts and verify that the public edge preserves them.',
+    autofix: manual('Adding headers means rewriting an existing next.config.ts export, and a generated Content-Security-Policy that does not match the app would break it in production.'),
     check: (context) => {
       const source = uncommented(context.readText('next.config.ts') ?? context.readText('next.config.mjs') ?? '')
       const activeHeaders = activeHeaderEntries(source)
@@ -794,6 +888,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'operations-health-check', title: 'A deployment health check is wired', category: 'Operations', severity: 'high',
     remediation: 'Expose the standard health route and configure the deployment platform to probe it with bounded timeouts.',
+    autofix: manual('Wiring the probe means editing existing deployment configuration, and a generated route could shadow the health route the core package already provides.'),
     check: (context) => {
       const route = dependencies(context).has('@open-mercato/core') || context.exists('src/app/api/healthz/route.ts')
       const configured = /\/api\/healthz/.test(context.collectDeploymentText())
@@ -805,6 +900,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'infrastructure-private-services', title: 'Stateful services are not publicly published', category: 'Infrastructure', severity: 'critical',
     remediation: 'Remove public host bindings for PostgreSQL, Redis, and search services; use private networks or an authenticated operator tunnel.',
+    autofix: manual('Removing a published port rewrites existing Compose configuration and can cut off local tooling that depends on it.'),
     check: (context) => {
       const composePresent = context.exists('docker-compose.yml') || context.exists('docker-compose.fullapp.yml')
       if (!composePresent) return { status: 'skipped', summary: 'No recognized in-repository Compose topology was found; verify provider networking separately.' }
@@ -817,6 +913,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'container-non-root-user', title: 'Production containers run as non-root', category: 'Containers', severity: 'high',
     remediation: 'Create an unprivileged runtime user and switch to it with USER in the final production image.',
+    autofix: manual('Appending a USER directive to an existing Dockerfile changes how every later layer and the entrypoint run, and can break file ownership at runtime.'),
     check: (context) => {
       const source = context.readText('Dockerfile')
       if (!source) return { status: 'skipped', summary: 'No Dockerfile is present.' }
@@ -831,6 +928,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'supply-chain-immutable-install', title: 'Deployments use immutable dependency installation', category: 'Supply chain', severity: 'high',
     remediation: 'Commit one lockfile and use an immutable/frozen install in image and CI builds.',
+    autofix: manual('Making an install immutable rewrites an existing install command in a Dockerfile or CI workflow.'),
     check: (context) => {
       const proof = dependencyInstallationProof(context)
       if (!proof.found) return { status: 'fail', summary: 'No immutable dependency installation was found in deployment configuration.' }
@@ -842,6 +940,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'supply-chain-single-lockfile', title: 'Exactly one package lockfile is committed', category: 'Supply chain', severity: 'medium',
     remediation: 'Commit the lockfile for the selected package manager and remove competing lockfiles.',
+    autofix: manual('Deleting a lockfile is destructive, and generating one requires running the target package manager, which the scanner never does.'),
     check: (context) => {
       const lockfiles = ['yarn.lock', 'package-lock.json', 'pnpm-lock.yaml'].filter(context.exists)
       return lockfiles.length === 1
@@ -852,6 +951,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'infrastructure-shared-redis', title: 'Multi-process deployments use shared Redis coordination', category: 'Infrastructure', severity: 'high',
     remediation: 'Use shared Redis-backed cache, events, and asynchronous queues whenever web and worker processes run separately.',
+    autofix: manual('The apply mode never writes any .env* file, and switching the cache strategy without a reachable Redis service would break the running app.'),
     check: (context) => {
       const hasWorker = workerDefinitions(context).length > 0
       if (!hasWorker) return { status: 'skipped', summary: 'No separate worker process was detected.' }
@@ -866,6 +966,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'release-database-migrations', title: 'Database migrations are part of release startup', category: 'Release', severity: 'high',
     remediation: 'Run the supported database migration command once per release before accepting traffic.',
+    autofix: manual('Adding a migration step rewrites an existing start command, and exactly one release job may run it — getting that wrong corrupts the database.'),
     check: (context) => /(?:db[: ]migrate|mercato\s+db\s+migrate)/i.test(executableDeploymentText(context))
       ? { status: 'warning', summary: 'A migration path exists; verify exactly one controlled release job can execute it.' }
       : { status: 'fail', summary: 'No database migration step was found in deployment configuration.' },
@@ -873,6 +974,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'release-immutable-artifact', title: 'Production deploys select an immutable artifact', category: 'Release', severity: 'high',
     remediation: 'Build once, identify the artifact by digest or commit SHA, and retain the prior compatible artifact for rollback.',
+    autofix: manual('Pinning an image rewrites existing deployment configuration, and only the release process knows the digest that belongs to this revision.'),
     check: (context) => {
       const source = ['docker-compose.yml', 'docker-compose.fullapp.yml', 'railway.toml', 'railway.worker.toml']
         .map((file) => context.readText(file) ?? '').join('\n')
@@ -889,6 +991,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'release-validation-gate', title: 'Release validation gates the exact revision', category: 'Release', severity: 'high',
     remediation: 'Make generation, production build, tests, and migration verification blocking steps for the exact release revision.',
+    autofix: manual('Release gating lives in existing CI workflows; a generated workflow would claim a gate that was never proven to run for this app.'),
     check: (context) => {
       const workflows = context.collectCiWorkflows()
       if (!workflows.length) return { status: 'warning', summary: 'No recognized in-repository CI workflow was found; verify the external release gate.' }
@@ -905,6 +1008,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'operations-worker-topology', title: 'Background workers have an explicit process topology', category: 'Operations', severity: 'high',
     remediation: 'Deploy the supported worker process separately, keep its release aligned with the web app, and monitor both.',
+    autofix: manual('A worker deployment surface is provider-specific infrastructure; a generated one would describe a process nobody deployed.'),
     check: (context) => {
       if (!dependencies(context).has('@open-mercato/queue')) return { status: 'skipped', summary: 'The queue package is not installed.' }
       const paths = workerDefinitions(context)
@@ -916,6 +1020,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'workers-release-parity', title: 'Web and worker processes use the same release artifact', category: 'Operations', severity: 'high',
     remediation: 'Deploy one immutable build to web and worker roles and vary only the supported entrypoint.',
+    autofix: manual('Aligning artifacts rewrites existing web or worker deployment definitions, and the scanner cannot know which of the two is authoritative.'),
     check: (context) => {
       if (workerDefinitions(context).length === 0) return { status: 'skipped', summary: 'No separate worker process was detected.' }
       const parity = workerArtifactParity(context)
@@ -927,6 +1032,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'storage-persistent-volume', title: 'Local storage is placed on persistent media', category: 'Data', severity: 'high',
     remediation: 'Use durable object storage or mount every local upload/document path on persistent media and include it in recovery plans.',
+    autofix: manual('Durable storage is provider configuration, not a file the scanner can add; a wrong mount silently loses uploads.'),
     check: (context) => {
       const installed = dependencies(context)
       if (!installed.has('@open-mercato/documents') && !installed.has('@open-mercato/core')) return { status: 'skipped', summary: 'No storage-owning Open Mercato package was detected.' }
@@ -939,6 +1045,13 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'data-backup-restore-runbook', title: 'Backups and restore rehearsal are documented', category: 'Data', severity: 'critical',
     remediation: 'Document database and file backups, retention, encryption, off-site copies, restore ownership, and a dated restore rehearsal.',
+    autofix: {
+      safety: 'safe-additive',
+      summary: `Create a ${BACKUP_RUNBOOK_PATH} stub when no backup-and-restore runbook exists.`,
+      plan: (context) => context.exists(BACKUP_RUNBOOK_PATH)
+        ? []
+        : [{ kind: 'create-file', path: BACKUP_RUNBOOK_PATH, contents: BACKUP_RUNBOOK_STUB, description: `create the ${BACKUP_RUNBOOK_PATH} stub (TODOs still need an owner and a dated rehearsal)` }],
+    },
     check: (context) => {
       const source = context.collectDeploymentText()
       return containsAll(source.toLowerCase(), ['backup', 'restore'])
@@ -949,6 +1062,13 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'release-rollback-runbook', title: 'Rollback and forward-fix procedures are documented', category: 'Release', severity: 'high',
     remediation: 'Document immutable artifact rollback, database compatibility constraints, forward-fix ownership, and rollback verification.',
+    autofix: {
+      safety: 'safe-additive',
+      summary: `Create a ${ROLLBACK_RUNBOOK_PATH} stub when no rollback runbook exists.`,
+      plan: (context) => context.exists(ROLLBACK_RUNBOOK_PATH)
+        ? []
+        : [{ kind: 'create-file', path: ROLLBACK_RUNBOOK_PATH, contents: ROLLBACK_RUNBOOK_STUB, description: `create the ${ROLLBACK_RUNBOOK_PATH} stub (TODOs still need an owner and a rehearsal)` }],
+    },
     check: (context) => /\brollback\b|\bforward[- ]fix\b/i.test(context.collectDeploymentText())
       ? { status: 'warning', summary: 'Rollback guidance exists; rehearse it against the actual provider and database change policy.' }
       : { status: 'fail', summary: 'No rollback or forward-fix runbook was found.' },
@@ -956,6 +1076,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'observability-telemetry-pipeline', title: 'Logs and telemetry have a production pipeline', category: 'Observability', severity: 'medium',
     remediation: 'Configure structured log collection plus an OTLP/APM backend, retention, alerts, and redaction checks.',
+    autofix: manual('A telemetry pipeline needs real endpoints and credentials, and the apply mode never writes any .env* file. A generated collector config would export nowhere.'),
     check: (context) => {
       const inventory = templateInventory(context)
       const config = ['docker/otel-collector-config.yaml', 'docker/otel-collector-config.yml'].filter(context.exists)
@@ -967,6 +1088,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'runtime-supported-node', title: 'The app pins a supported Node.js runtime', category: 'Runtime', severity: 'medium',
     remediation: 'Declare Node.js 24 or newer in package.json and pin the same major in the deployment environment.',
+    autofix: manual('An engines constraint is a compatibility claim about the app and its deployment image; asserting it from a scanner could break installs on an unmigrated runtime.'),
     check: (context) => {
       const engines = context.packageJson.engines
       const node = engines && typeof engines === 'object' && !Array.isArray(engines) ? (engines as Record<string, unknown>).node : undefined
@@ -978,6 +1100,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'runtime-debug-features-disabled', title: 'Development-only features default off', category: 'Runtime', severity: 'high',
     remediation: 'Keep debug, profiling, autologin, test injection, and DevTools switches disabled in the production template.',
+    autofix: manual('Flipping a switch means rewriting an existing value in a .env* file, which the apply mode never does.'),
     check: (context) => {
       const inventory = templateInventory(context)
       const risky = [...inventory.booleans].filter(([, enabled]) => enabled).map(([key]) => key)

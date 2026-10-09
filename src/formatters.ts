@@ -1,4 +1,4 @@
-import type { FindingStatus, RuleResult, ScanReport } from './types.js'
+import type { ApplyOutcome, ApplyPlan, FindingStatus, RuleResult, ScanReport } from './types.js'
 
 const ICONS: Record<FindingStatus, string> = { pass: '✅', fail: '❌', warning: '⚠️ ', skipped: '⏭️ ' }
 const STATUS_ORDER: FindingStatus[] = ['fail', 'warning', 'skipped', 'pass']
@@ -73,4 +73,52 @@ export function formatMarkdown(report: ScanReport): string {
 
 export function formatJson(report: ScanReport): string {
   return `${JSON.stringify(report, null, 2)}\n`
+}
+
+/** Renders the confirmation preview shown before anything is written. */
+export function formatApplyPlan(plan: ApplyPlan, color = true): string {
+  const colors = colorizer(color)
+  const lines = [colors.bold('Safe policies to apply'), '']
+  if (!plan.planned.length) lines.push('   Nothing to apply: no failing rule has a safe, purely additive fix left.')
+  for (const fix of plan.planned) {
+    lines.push(`${ICONS.fail} ${colors.bold(fix.title)} ${colors.dim(`[${fix.id} · ${fix.severity}]`)}`)
+    for (const action of fix.actions) lines.push(`   + ${action.description}`)
+  }
+  if (plan.skipped.length) {
+    lines.push('', colors.bold('Manual-only, left untouched'), '')
+    for (const fix of plan.skipped) {
+      lines.push(`${ICONS.skipped} ${colors.status('skipped', fix.title)} ${colors.dim(`[${fix.id} · ${fix.severity}]`)}`, `   ${fix.reason}`, `   Docs: ${fix.docsUrl}`)
+    }
+  }
+  return `${lines.join('\n')}\n`
+}
+
+export function formatApplyOutcome(outcome: ApplyOutcome, color = true): string {
+  const colors = colorizer(color)
+  const written = outcome.changes.filter((change) => change.changed)
+  const lines = [
+    colors.bold(outcome.dryRun ? 'Dry run: nothing was written' : 'Applied safe policies'),
+    colors.dim(`Target: ${outcome.plan.root}`),
+    '',
+  ]
+  if (!outcome.changes.length) lines.push('   Nothing to do: every safely fixable rule is already satisfied.')
+  for (const change of outcome.changes) {
+    const marker = outcome.dryRun ? '+ ' : change.changed ? ICONS.pass : ICONS.skipped
+    lines.push(`${marker} ${change.description} ${colors.dim(`[${change.id}${change.path ? ` · ${change.path}` : ''}]`)}`)
+    if (change.note && !outcome.dryRun) lines.push(colors.dim(`   ${change.note}`))
+  }
+  if (outcome.plan.skipped.length) {
+    lines.push('', colors.bold('Skipped (manual only)'), '')
+    for (const fix of outcome.plan.skipped) {
+      lines.push(`${ICONS.skipped} ${colors.status('skipped', fix.title)} ${colors.dim(`[${fix.id} · ${fix.severity}]`)}`, `   ${fix.reason}`, `   Docs: ${fix.docsUrl}`)
+    }
+  }
+  lines.push(
+    '',
+    outcome.dryRun
+      ? `${outcome.changes.length} change(s) planned, ${outcome.plan.skipped.length} rule(s) manual only.`
+      : `${written.length} change(s) written, ${outcome.changes.length - written.length} already satisfied, ${outcome.plan.skipped.length} rule(s) manual only.`,
+  )
+  if (!outcome.dryRun && written.length) lines.push(colors.dim('Review the writes with `git diff` and `git status`, then commit or revert them.'))
+  return `${lines.join('\n')}\n`
 }

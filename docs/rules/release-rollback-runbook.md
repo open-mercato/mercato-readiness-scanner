@@ -14,4 +14,10 @@ provider commands and abort thresholds, classify migration compatibility, and
 define worker and traffic handling. Rehearse rollback or forward-fix recovery in
 a production-like environment.
 
+## Automatic fix
+
+`mercato-readiness apply` can create a `docs/runbooks/rollback-and-forward-fix.md` stub when no
+rollback runbook exists. The stub is a TODO checklist: it moves this rule to ⚠️ *review*, and only
+a rehearsal against the actual provider can satisfy it.
+
 See [Prepare and rehearse rollback](https://docs.openmercato.com/deployment/production-readiness#ordered-production-checklist).
