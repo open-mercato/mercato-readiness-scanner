@@ -15,4 +15,10 @@ Add narrowly scoped patterns for `.env`, `.env.production`, `.env.local`,
 `.ai/session-exports/`. Keep explicit exceptions only for sanitized templates.
 Verify the policy with `git check-ignore` before handling production values.
 
+## Automatic fix
+
+`mercato-readiness apply` can fix this rule: it appends only the missing patterns to
+`.gitignore`, or creates the file when it is absent. Existing lines are never rewritten, and the
+exceptions you keep for sanitized templates are left alone.
+
 See [Prepare the production environment and secrets](https://docs.openmercato.com/deployment/production-readiness#ordered-production-checklist).

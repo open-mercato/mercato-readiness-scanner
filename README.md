@@ -1,8 +1,12 @@
 # Open Mercato Readiness Scanner
 
-A read-only TypeScript CLI that inspects an application created with
+A TypeScript CLI that inspects an application created with
 [`create-mercato-app`](https://www.npmjs.com/package/create-mercato-app) and reports
 production-readiness gaps with security-scanner-style results.
+
+`scan` is strictly read-only. The separate, opt-in [`apply`](#apply-the-remediations) command is
+the only way the tool ever writes to the scanned application, and it writes only purely additive
+fixes into a git working tree you can revert.
 
 > This repository is private and the package is **not published to npm**. Run it
 > from a trusted local checkout until the project is intentionally released.
@@ -48,12 +52,96 @@ always returns 0 after a successful scan. Invalid usage or an invalid target
 returns 2; an unexpected scanner or output failure returns 3. Findings are
 rendered or saved before the exit threshold is applied.
 
+## Apply the remediations
+
+`mercato-readiness apply` is the one opt-in exception to the read-only rule. It has two modes.
+
+### Hard preconditions
+
+`apply` refuses to write anything unless both hold:
+
+- The target is a git working tree (`git rev-parse --is-inside-work-tree`). Git is the only undo
+  for these writes, so a non-git target exits 2 with an actionable error.
+- That worktree has no uncommitted changes, so you can always tell with `git diff` and
+  `git status` exactly what was written. Pass `--allow-dirty` to apply over existing changes
+  anyway. Untracked files count as uncommitted, because newly created files are untracked too.
+
+On a TTY, `apply` prints the plan and asks before writing. It never prompts when stdin is not a
+TTY: there, without `--yes` (alias `--non-interactive`), it exits 2 with a usage error instead of
+hanging. `--dry-run` reports the plan and writes nothing.
+
+### Mode `direct` (default): the CLI writes the safe fixes
+
+```bash
+node dist/cli.js apply /path/to/open-mercato-app            # asks first on a TTY
+node dist/cli.js apply /path/to/open-mercato-app --dry-run  # plan only, writes nothing
+```
+
+Only policies that are **purely additive and cannot lose data** are applied. Every rule carries an
+explicit safety class, so each one is deliberately either auto-fixable or manual-only. Today these
+four rules are auto-fixable:
+
+| Rule | What `apply` writes |
+|---|---|
+| [`secrets-ignore-policy`](docs/rules/secrets-ignore-policy.md) | appends the missing ignore patterns to `.gitignore`, or creates it |
+| [`runtime-production-scripts`](docs/rules/runtime-production-scripts.md) | inserts a missing `build` or `start` key into `package.json` |
+| [`data-backup-restore-runbook`](docs/rules/data-backup-restore-runbook.md) | creates a `docs/runbooks/backup-and-restore.md` stub |
+| [`release-rollback-runbook`](docs/rules/release-rollback-runbook.md) | creates a `docs/runbooks/rollback-and-forward-fix.md` stub |
+
+What `apply` never does: overwrite or truncate existing content, rewrite existing configuration,
+delete anything, write or read any `.env*` or credential file, follow a symlink, write outside the
+application root, or run the target's scripts. An existing `package.json` script value is never
+changed — only a missing key is inserted, and only when the file round-trips byte-for-byte through
+`JSON.parse`/`JSON.stringify` so the inserted key is provably the only difference. The runbook
+stubs are TODO checklists: they move a rule from ❌ to ⚠️ *review*, they do not prove a backup or
+a rehearsal happened.
+
+Every other rule stays manual-only and is reported as skipped with the reason and its docs URL.
+A second `apply` against an already-fixed project is a no-op.
+
+### Mode `agent`: delegate to `cezar-run`
+
+Instead of writing files, `apply --mode agent` builds a remediation prompt from the scan results
+and hands it to the [`cezar-run`](https://www.npmjs.com/package/cezar-run) CLI. The prompt carries
+the findings, the per-rule documentation URLs, the secret-handling constraints, and a definition of
+done. It references the report file when this run saved one (via `--markdown`, `--json`, or
+`--output`) and inlines the Markdown report otherwise.
+
+```bash
+# Inspect the prompt without running anything.
+node dist/cli.js apply . --mode agent --markdown readiness.md --print-prompt
+
+# Resolve the binary explicitly, then delegate.
+node dist/cli.js apply . --mode agent --cezar-run ~/.local/bin/cezar-run --yes
+```
+
+The binary is resolved from `--cezar-run`, then the `MERCATO_READINESS_CEZAR_RUN` environment
+variable, then a bare `cezar-run` on `PATH`; an explicit flag or env value must point at an
+executable file. The invocation is `cezar-run run "<prompt>" --repo <target>`, optionally with
+`--workflow <name>`. No model and no provider is ever passed — that stays `cezar-run`'s decision,
+and no other agent CLI is ever spawned.
+
+### Non-interactive CI invocation
+
+Copy-pasteable, and safe to run on a clean checkout:
+
+```bash
+node dist/cli.js scan . --json readiness.json --fail-on high \
+  || node dist/cli.js apply . --yes --no-color
+```
+
+`apply` exits 0 when it finishes (including when there was nothing to do), 2 on a refused
+precondition — not a git working tree, uncommitted changes without `--allow-dirty`, a missing
+`--yes` on a non-TTY, an unusable `cezar-run` path, or an unsafe write target — and 3 on an
+unexpected failure. In agent mode it returns `cezar-run`'s own exit code.
+
 ## What the scanner does
 
 The scanner recognizes a generated Open Mercato app by its
 `@open-mercato/core` dependency and `src/modules.ts`. It examines only bounded,
 local configuration and documentation surfaces. It never runs target scripts,
-loads the application, contacts its services, or performs network probes.
+loads the application, contacts its services, or performs network probes — in
+`scan` and in `apply` alike.
 
 Live `.env*` files are never opened. Git is queried only for tracked path names
 so the scanner can report a committed live environment file without reading its
@@ -109,6 +197,9 @@ JSON output follows [`docs/report.schema.json`](docs/report.schema.json). It
 contains the scanner version, scan timestamp, target directory name, aggregate
 counts, and one result per rule. Consumers should key on `schemaVersion` and
 `results[].id`, not display text.
+
+`schemaVersion` stays `1`: the apply-mode safety classification is CLI metadata and is
+deliberately kept out of the report, so the report shape is unchanged by the `apply` command.
 
 ## Development
 
