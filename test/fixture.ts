@@ -1,0 +1,85 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { spawnSync } from 'node:child_process'
+
+const FILES: Record<string, string> = {
+  'package.json': JSON.stringify({
+    name: 'readiness-fixture',
+    private: true,
+    engines: { node: '>=24.0.0' },
+    scripts: {
+      build: 'cross-env NODE_ENV=production next build',
+      start: 'mercato server start',
+    },
+    dependencies: {
+      '@open-mercato/core': '1.0.0',
+      '@open-mercato/queue': '1.0.0',
+      '@open-mercato/checkout': '1.0.0',
+      '@open-mercato/documents': '1.0.0',
+    },
+  }, null, 2),
+  'src/modules.ts': 'export default []\n',
+  '.env.example': [
+    'NODE_ENV=production',
+    'APP_URL=https://shop.example.com',
+    'DATABASE_URL=',
+    'RATE_LIMIT_TRUST_PROXY_DEPTH=1',
+    'APP_ALLOWED_ORIGINS=https://shop.example.com',
+    'CHECKOUT_ALLOWED_ORIGINS=https://shop.example.com',
+    'DOCUMENTS_COLLAB_ALLOWED_ORIGINS=https://shop.example.com',
+    'OTEL_EXPORTER_OTLP_ENDPOINT=',
+    'NEXT_PUBLIC_UMES_DEVTOOLS=false',
+    'NEXT_PUBLIC_OM_EXAMPLE_CHECKOUT_TEST_INJECTIONS_ENABLED=false',
+  ].join('\n'),
+  '.gitignore': [
+    '.env',
+    '.env.*',
+    '!.env.example',
+    '*.pem',
+    '.mcp.json',
+    '.npmrc',
+    '.ai/session-exports/',
+  ].join('\n'),
+  'next.config.ts': [
+    "const headers = ['Content-Security-Policy', 'Strict-Transport-Security', 'X-Content-Type-Options']",
+    'export default { headers }',
+  ].join('\n'),
+  Dockerfile: [
+    'FROM node:24-alpine',
+    'RUN yarn install --immutable',
+    'RUN adduser -D mercato',
+    'USER mercato',
+  ].join('\n'),
+  'railway.toml': '[deploy]\nhealthcheckPath = "/api/healthz"\nstartCommand = "yarn db:migrate && yarn start"\n',
+  'railway.worker.toml': '[deploy]\nstartCommand = "yarn mercato worker"\n',
+  'docker-compose.fullapp.yml': 'services:\n  app:\n    volumes:\n      - uploads:/app/storage\nvolumes:\n  uploads:\n',
+  'docker/otel-collector-config.yaml': 'receivers:\n  otlp:\nexporters:\n  debug:\n',
+  'docs/operations.md': [
+    '# Production operations',
+    'Use TLS and HTTPS with certificate renewal and the canonical origin.',
+    'Use a persistent volume for uploads and storage.',
+    'Run database migrate once, then supervise each queue worker.',
+    'Back up the database and files and rehearse restore in isolation.',
+    'Keep the prior artifact and rehearse rollback or forward-fix procedures.',
+  ].join('\n'),
+  'yarn.lock': '# fixture lockfile\n',
+}
+
+export function makeAppFixture(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mercato-readiness-'))
+  for (const [relativePath, contents] of Object.entries(FILES)) {
+    const destination = path.join(root, relativePath)
+    fs.mkdirSync(path.dirname(destination), { recursive: true })
+    fs.writeFileSync(destination, contents)
+  }
+  const init = spawnSync('git', ['init', '--quiet'], { cwd: root })
+  if (init.status !== 0) throw new Error('git init failed for test fixture')
+  const add = spawnSync('git', ['add', '.'], { cwd: root })
+  if (add.status !== 0) throw new Error('git add failed for test fixture')
+  return root
+}
+
+export function removeFixture(root: string): void {
+  fs.rmSync(root, { recursive: true, force: true })
+}

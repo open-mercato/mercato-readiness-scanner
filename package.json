@@ -1,0 +1,29 @@
+{
+  "name": "@open-mercato/readiness-scanner",
+  "version": "0.1.0",
+  "description": "Static production-readiness scanner for Open Mercato applications.",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "mercato-readiness": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "docs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "tsx": "^4.7.0",
+    "typescript": "^6.0.3"
+  }
+}

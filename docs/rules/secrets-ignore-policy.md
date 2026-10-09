@@ -1,0 +1,17 @@
+# Sensitive local files are ignored
+
+**Rule ID:** `secrets-ignore-policy`
+**Severity:** High
+
+The repository ignore policy should cover live environment files, private keys,
+local MCP and npm credentials, and raw agent-session exports. This is a guardrail
+against accidental commits, not a substitute for secret scanning or credential
+rotation.
+
+## Remediation
+
+Add narrowly scoped patterns for `.env`, `*.pem`, `.mcp.json`, `.npmrc`, and
+`.ai/session-exports/`. Keep explicit exceptions only for sanitized templates.
+Verify the policy with `git check-ignore` before handling production values.
+
+See [Prepare the production environment and secrets](https://docs.openmercato.com/deployment/production-readiness#ordered-production-checklist).

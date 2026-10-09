@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/open-mercato/mercato-readiness-scanner/blob/main/docs/report.schema.json",
+  "title": "Open Mercato readiness report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "tool", "scannedAt", "target", "summary", "results"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "const": "@open-mercato/readiness-scanner" },
+        "version": { "type": "string" }
+      }
+    },
+    "scannedAt": { "type": "string", "format": "date-time" },
+    "target": { "type": "string", "minLength": 1 },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total", "pass", "fail", "warning", "skipped"],
+      "properties": {
+        "total": { "type": "integer", "minimum": 0 },
+        "pass": { "type": "integer", "minimum": 0 },
+        "fail": { "type": "integer", "minimum": 0 },
+        "warning": { "type": "integer", "minimum": 0 },
+        "skipped": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "results": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/result" }
+    }
+  },
+  "$defs": {
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "title", "category", "severity", "status", "summary", "evidence", "remediation", "docsUrl"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        "title": { "type": "string" },
+        "category": { "type": "string" },
+        "severity": { "enum": ["critical", "high", "medium", "low"] },
+        "status": { "enum": ["pass", "fail", "warning", "skipped"] },
+        "summary": { "type": "string" },
+        "evidence": { "type": "array", "items": { "type": "string" } },
+        "remediation": { "type": "string" },
+        "docsUrl": { "type": "string", "format": "uri" }
+      }
+    }
+  }
+}
