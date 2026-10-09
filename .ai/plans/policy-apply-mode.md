@@ -111,3 +111,14 @@ Keep `test/cli.test.ts`, `test/scanner.test.ts` and `test/policies.test.ts` gree
 - Your report states which rules you classified as safe-autofixable vs manual-only, and why.
 - Do **not** open a pull request and do **not** push to `main` — the parent task merges
   your branch and handles the PR.
+
+## Progress
+
+PR: #2
+
+- [x] Phase 1: per-rule autofix safety classification — 33e9dfc
+- [x] Phase 2: additive-only writer + git preconditions — ad30ac3
+- [x] Phase 3: apply subcommand, direct and cezar-run modes — d2870be
+- [x] Phase 4: integration tests on real temp git repos — 5d4d8ec
+- [x] Phase 5: README + AGENTS.md carve-out — 19a53da
+- [x] Post-review fix: align secrets-ignore autofix with main's effective-coverage check; add `force` append and its regression test — 3f5ddf2
