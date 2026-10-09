@@ -64,7 +64,9 @@ test('packed npm CLI scans a fresh standalone Open Mercato app and saves valid s
     run(npm, ['install', '--ignore-scripts', '--no-audit', '--no-fund', path.join(workspace, filename)], consumer)
     const installed = path.join(consumer, 'node_modules/@open-mercato/readiness-scanner')
     assert.equal(fs.existsSync(path.join(installed, 'src')), false)
-    assert.equal(fs.existsSync(path.join(installed, 'node_modules')), false, 'CLI must need no runtime dependencies')
+    for (const tool of ['typescript', 'tsx']) {
+      assert.equal(fs.existsSync(path.join(consumer, 'node_modules', tool)), false, 'Installed CLI must not need development tools')
+    }
     const manifest = JSON.parse(fs.readFileSync(path.join(installed, 'package.json'), 'utf8')) as { version: string }
     const cliVersion = run(npm, ['exec', '--offline', '--', 'mercato-readiness', '--version'], consumer).trim()
     assert.equal(cliVersion, manifest.version)

@@ -48,7 +48,7 @@ const cases: { id: string; baseline: FindingStatus; changed: FindingStatus; chan
   { id: 'release-immutable-artifact', baseline: 'warning', changed: 'fail', changes: { files: { 'docker-compose.fullapp.yml': 'services:\n  app:\n    image: app:latest' } } },
   { id: 'release-validation-gate', baseline: 'pass', changed: 'fail', changes: { files: { '.github/workflows/release.yml': 'steps:\n  - run: npm run build\n    continue-on-error: true' } } },
   { id: 'operations-worker-topology', baseline: 'pass', changed: 'fail', changes: { files: { 'railway.worker.toml': null, 'docker-compose.fullapp.yml': null } } },
-  { id: 'workers-release-parity', baseline: 'pass', changed: 'fail', changes: { files: { 'railway.worker.toml': 'dockerfilePath = "Dockerfile.worker"' } } },
+  { id: 'workers-release-parity', baseline: 'pass', changed: 'fail', changes: { files: { 'railway.worker.toml': 'startCommand = "yarn mercato worker"\ndockerfilePath = "Dockerfile.worker"' } } },
   { id: 'storage-persistent-volume', baseline: 'warning', changed: 'fail', changes: { files: { 'docs/operations.md': '', 'docker-compose.fullapp.yml': '' } } },
   { id: 'data-backup-restore-runbook', baseline: 'warning', changed: 'fail', changes: { files: { 'docs/operations.md': 'Backups are configured.' } } },
   { id: 'release-rollback-runbook', baseline: 'warning', changed: 'fail', changes: { files: { 'docs/operations.md': '' } } },

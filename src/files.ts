@@ -39,16 +39,16 @@ function resolvesWithinRoot(root: string, absolute: string): boolean {
   }
 }
 
-function isForbiddenEnv(relativePath: string): boolean {
+export function isLiveEnvPath(relativePath: string): boolean {
   const basename = path.posix.basename(normalized(relativePath)).toLowerCase()
   return basename.startsWith('.env') && !SAFE_ENV_TEMPLATES.has(basename)
 }
 
-function isForbiddenCredential(relativePath: string): boolean {
+export function isCredentialPath(relativePath: string): boolean {
   const normalizedPath = normalized(relativePath).toLowerCase()
   const basename = path.posix.basename(normalizedPath).toLowerCase()
   return /\.(?:pem|key|p12|pfx|jks)$/i.test(basename)
-    || ['id_rsa', 'id_ed25519', '.mcp.json', '.npmrc', '.netrc', '.git-credentials', 'credentials', 'credentials.json', 'token', 'tokens.json'].includes(basename)
+    || ['id_rsa', 'id_dsa', 'id_ecdsa', 'id_xmss', 'id_ed25519', '.mcp.json', '.npmrc', '.netrc', '.git-credentials', 'credentials', 'credentials.json', 'token', 'tokens.json'].includes(basename)
     || /(?:^|\/)(?:\.ssh|\.aws|\.azure|\.gnupg|\.kube|\.secrets|secrets|\.config\/gcloud|\.git)(?:\/|$)/.test(normalizedPath)
     || /(?:^|\/)\.(?:codex|cursor)\/mcp\.json$/i.test(normalizedPath)
 }
@@ -65,7 +65,7 @@ export function existsInside(root: string, relativePath: string): boolean {
 }
 
 export function readSafeText(root: string, relativePath: string): string | null {
-  if (isForbiddenEnv(relativePath) || isForbiddenCredential(relativePath)) return null
+  if (isLiveEnvPath(relativePath) || isCredentialPath(relativePath)) return null
   return readBoundedText(root, relativePath)
 }
 
@@ -157,7 +157,7 @@ export function inspectPermissions(root: string, relativePath: string): Permissi
 }
 
 export function gitTrackedFiles(root: string): ReadonlySet<string> | null {
-  const result = spawnSync('git', ['-c', 'core.fsmonitor=false', 'ls-files', '-z'], {
+  const result = spawnSync('git', ['-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null', 'ls-files', '-z'], {
     cwd: root,
     encoding: 'utf8',
     timeout: 5_000,
@@ -189,7 +189,7 @@ function collectTextFiles(root: string, relativeRoot: string, allowed: RegExp): 
     }
     for (const entry of entries) {
       const relative = normalized(path.relative(root, path.join(directory, entry.name)))
-      if (entry.isSymbolicLink() || isForbiddenEnv(relative) || isForbiddenCredential(relative)) continue
+      if (entry.isSymbolicLink() || isLiveEnvPath(relative) || isCredentialPath(relative)) continue
       const absolute = path.join(directory, entry.name)
       if (entry.isDirectory()) visit(absolute, depth + 1)
       else if (entry.isFile() && allowed.test(entry.name)) found.push(normalized(path.relative(root, absolute)))
@@ -207,9 +207,5 @@ export function collectDeploymentText(root: string): string {
 
 export function collectCiText(root: string): string {
   const files = collectTextFiles(root, '.github/workflows', /\.(?:yml|yaml)$/i)
-  return files.map((file) => readSafeText(root, file)).filter((value): value is string => value !== null).join('\n')
-}
-
-export function isLiveEnvPath(relativePath: string): boolean {
-  return isForbiddenEnv(relativePath)
+  return files.map((file) => readSafeText(root, file)).filter((value): value is string => value !== null).join('\n---\n')
 }

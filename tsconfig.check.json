@@ -4,5 +4,11 @@
     "rootDir": ".",
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "scripts/**/*.ts", "test/**/*.ts", "eslint.config.ts"]
+  "include": [
+    "src/**/*.ts",
+    "scripts/**/*.ts",
+    "test/**/*.ts",
+    "eslint.config.ts",
+    "test-built/**/*.ts"
+  ]
 }

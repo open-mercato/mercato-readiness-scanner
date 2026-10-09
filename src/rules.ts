@@ -1,5 +1,9 @@
-import { isLiveEnvPath } from './files.js'
 import { SECURITY_RULES } from './security-rules.js'
+import { isIP } from 'node:net'
+import { parseEnv } from 'node:util'
+import { minVersion, validRange } from 'semver'
+import { parse, parseAllDocuments } from 'yaml'
+import { isCredentialPath, isLiveEnvPath } from './files.js'
 import type { RuleCheck, RuleDefinition, ScanContext, Severity } from './types.js'
 
 const DOCS_BASE = 'https://github.com/open-mercato/mercato-readiness-scanner/blob/main/docs/rules'
@@ -45,18 +49,22 @@ function templateInventory(context: ScanContext): TemplateInventory {
   const booleans = new Map<string, boolean>()
   const integers = new Map<string, number>()
   const enums = new Map<string, string>()
-  for (const line of source.split(/\r?\n/)) {
-    const match = line.match(/^([A-Z][A-Z0-9_]*)=(.*)$/)
-    if (match?.[1] === undefined || match[2] === undefined) continue
-    const key = match[1]
-    const rawValue = match[2].trim()
+  let values: Record<string, string | undefined>
+  try {
+    values = parseEnv(source)
+  } catch {
+    values = {}
+  }
+  for (const [key, rawValue] of Object.entries(values)) {
+    if (!/^[A-Z][A-Z0-9_]*$/.test(key) || rawValue === undefined) continue
     names.add(key)
+    const normalizedValue = rawValue.trim()
     if (/(?:DEBUG|PROFILE|DEVTOOLS|AUTOLOGIN|TEST_INJECT|DEMO_MODE|EMERGENCY_BYPASS|INTEGRATION_TEST|AUTO_SPAWN_WORKERS)/.test(key)) {
-      if (/^(?:1|true|yes|on)$/i.test(rawValue)) booleans.set(key, true)
-      if (/^(?:0|false|no|off)$/i.test(rawValue)) booleans.set(key, false)
+      if (/^(?:1|true|yes|y|on|enabled)$/i.test(normalizedValue)) booleans.set(key, true)
+      if (/^(?:0|false|no|n|off|disabled)$/i.test(normalizedValue)) booleans.set(key, false)
     }
-    if (key === 'RATE_LIMIT_TRUST_PROXY_DEPTH' && /^-?\d+$/.test(rawValue)) integers.set(key, Number(rawValue))
-    if (key === 'CACHE_STRATEGY' && /^(?:redis|memory|sqlite)$/i.test(rawValue)) enums.set(key, rawValue.toLowerCase())
+    if (key === 'RATE_LIMIT_TRUST_PROXY_DEPTH' && /^-?\d+$/.test(normalizedValue)) integers.set(key, Number(normalizedValue))
+    if (key === 'CACHE_STRATEGY' && /^(?:redis|memory|sqlite)$/i.test(normalizedValue)) enums.set(key, normalizedValue.toLowerCase())
   }
   return { names, booleans, integers, enums }
 }
@@ -70,7 +78,7 @@ function fileEvidence(paths: string[]): string[] {
 }
 
 function displayPath(value: string): string {
-  // eslint-disable-next-line no-control-regex -- strip control characters from untrusted paths
+  // eslint-disable-next-line no-control-regex -- Strip control characters from untrusted path evidence.
   return value.replace(/[\u0000-\u001F\u007F]/g, '?').slice(0, 240)
 }
 
@@ -79,12 +87,33 @@ function ignorePatterns(context: ScanContext): ReadonlySet<string> {
   return new Set(source.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !line.startsWith('#')))
 }
 
-function trackedCredentialPath(relativePath: string): boolean {
-  const normalized = relativePath.replaceAll('\\', '/')
-  const basename = normalized.split('/').at(-1)?.toLowerCase() ?? ''
-  return /\.(?:pem|key|p12|pfx|jks)$/i.test(basename)
-    || ['id_rsa', 'id_ed25519', '.mcp.json', '.npmrc'].includes(basename)
-    || /(?:^|\/)\.(?:codex|cursor)\/mcp\.json$/i.test(normalized)
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function isLoopbackBinding(value: string): boolean {
+  const normalized = value.replace(/^['"]|['"]$/g, '').trim()
+  if (normalized.startsWith('[')) {
+    const closing = normalized.indexOf(']')
+    return closing > 0 && normalized[closing + 1] === ':' && isLoopbackHost(normalized.slice(1, closing))
+  }
+  const separator = normalized.indexOf(':')
+  return separator > 0 && isLoopbackHost(normalized.slice(0, separator))
+}
+
+function isLoopbackHost(value: unknown): boolean {
+  if (typeof value !== 'string') return false
+  const normalized = value.trim().toLowerCase()
+  if (normalized === 'localhost') return true
+  if (isIP(normalized) === 4) return normalized.startsWith('127.')
+  if (isIP(normalized) !== 6) return false
+  const halves = normalized.split('::')
+  if (halves.length > 2) return false
+  const left = halves[0] ? halves[0].split(':') : []
+  const right = halves[1] ? halves[1].split(':') : []
+  const missing = halves.length === 2 ? 8 - left.length - right.length : 0
+  const groups = [...left, ...Array.from({ length: missing }, () => '0'), ...right]
+  return groups.length === 8 && groups.slice(0, 7).every((group) => Number.parseInt(group || '0', 16) === 0) && Number.parseInt(groups[7] ?? '0', 16) === 1
 }
 
 function composePublicBindings(context: ScanContext): string[] {
@@ -92,41 +121,294 @@ function composePublicBindings(context: ScanContext): string[] {
   for (const file of ['docker-compose.yml', 'docker-compose.fullapp.yml']) {
     const source = context.readText(file)
     if (!source) continue
-    const lines = source.split(/\r?\n/)
-    let service: string | null = null
-    let portsIndent = -1
-    for (const line of lines) {
-      const serviceMatch = line.match(/^ {2}([A-Za-z0-9_.-]+):\s*(?:#.*)?$/)
-      if (serviceMatch?.[1]) {
-        service = serviceMatch[1]
-        portsIndent = -1
+    let root: unknown
+    try {
+      root = parse(source, { merge: true })
+    } catch {
+      findings.push(`${file}: Compose configuration could not be safely parsed`)
+      continue
+    }
+    if (!isRecord(root) || !isRecord(root.services)) {
+      findings.push(`${file}: Compose services could not be safely inspected`)
+      continue
+    }
+    for (const [name, value] of Object.entries(root.services)) {
+      if (!isRecord(value)) continue
+      const image = typeof value.image === 'string' ? value.image : ''
+      if (!/(?:postgres|redis|search|opensearch|elastic|meili)/i.test(`${name}\n${image}`)) continue
+      if (value.network_mode === 'host') findings.push(`${file}: a recognized stateful service uses host networking`)
+      if (value.ports === undefined) continue
+      if (!Array.isArray(value.ports)) {
+        findings.push(`${file}: a recognized stateful service uses unsupported ports syntax`)
         continue
       }
-      if (!service || !/(?:postgres|redis|search|opensearch|elastic|meili)/i.test(service)) continue
-      const indent = line.length - line.trimStart().length
-      if (/^\s+ports:\s*(?:#.*)?$/.test(line)) {
-        portsIndent = indent
-        continue
+      for (const port of value.ports) {
+        if (typeof port === 'string' || typeof port === 'number') {
+          const binding = String(port)
+          if (!isLoopbackBinding(binding)) findings.push(`${file}: a recognized stateful service publishes a non-loopback host port.`)
+        } else if (isRecord(port)) {
+          if (!isLoopbackHost(port.host_ip)) findings.push(`${file}: a recognized stateful service publishes a long-syntax port`)
+        } else {
+          findings.push(`${file}: a recognized stateful service uses unsupported ports syntax`)
+        }
       }
-      if (portsIndent >= 0 && indent <= portsIndent && line.trim()) portsIndent = -1
-      if (portsIndent < 0) continue
-      const binding = line.match(/^\s+-\s*["']?([^"'#]+)["']?/)?.[1]?.trim()
-      if (!binding || /^(?:127\.0\.0\.1|localhost):/.test(binding)) continue
-      findings.push(`${file}: a recognized stateful service publishes a non-loopback host port.`)
     }
   }
   return findings
 }
 
-function workerDockerfiles(context: ScanContext): string[] {
-  const values: string[] = []
-  for (const file of ['railway.toml', 'railway.worker.toml']) {
-    const source = context.readText(file)
-    if (!source) continue
-    const configured = source.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1]
-    values.push(configured ?? 'Dockerfile')
+function uncommented(source: string): string {
+  let output = ''
+  let quote = ''
+  let escaped = false
+  let blockComment = false
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index] ?? ''
+    const next = source[index + 1] ?? ''
+    if (blockComment) {
+      if (character === '*' && next === '/') {
+        blockComment = false
+        index += 1
+      } else if (character === '\n') output += '\n'
+      continue
+    }
+    if (quote) {
+      output += character
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === quote) quote = ''
+      continue
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character
+      output += character
+      continue
+    }
+    if (character === '/' && next === '*') {
+      blockComment = true
+      index += 1
+      continue
+    }
+    if (character === '/' && next === '/') {
+      while (index < source.length && source[index] !== '\n') index += 1
+      output += '\n'
+      continue
+    }
+    if (character === '#' && (index === 0 || /\s/.test(source[index - 1] ?? ''))) {
+      while (index < source.length && source[index] !== '\n') index += 1
+      output += '\n'
+      continue
+    }
+    output += character
   }
-  return values
+  return output
+}
+
+function executableDeploymentText(context: ScanContext): string {
+  return ['Dockerfile', 'railway.toml', 'railway.worker.toml', 'scripts/railway-start.sh', 'scripts/railway-worker.sh', 'docker/scripts/init-or-migrate.sh']
+    .map((file) => uncommented(context.readText(file) ?? ''))
+    .join('\n')
+}
+
+function isWorkerCommand(value: string): boolean {
+  return /(?:^|[;&]\s*)(?:exec\s+)?(?:(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:mercato\s+)?worker|mercato\s+worker)(?:\s|$)/im.test(value)
+}
+
+function workerDefinitions(context: ScanContext): string[] {
+  const paths: string[] = []
+  const railway = context.readText('railway.worker.toml')
+  if (railway) {
+    const command = uncommented(railway).match(/(?:startCommand|command)\s*=\s*["']([^"']+)["']/i)?.[1]
+    if (command && isWorkerCommand(command)) paths.push('railway.worker.toml')
+  }
+  const script = context.readText('scripts/railway-worker.sh')
+  if (script && isWorkerCommand(uncommented(script))) paths.push('scripts/railway-worker.sh')
+  const compose = context.readText('docker-compose.fullapp.yml')
+  if (compose) {
+    try {
+      const root: unknown = parse(compose, { merge: true })
+      if (isRecord(root) && isRecord(root.services)) {
+        const worker = Object.entries(root.services).some(([, value]) => {
+          if (!isRecord(value)) return false
+          const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
+          return isWorkerCommand(command)
+        })
+        if (worker) paths.push('docker-compose.fullapp.yml')
+      }
+    } catch {
+      return paths
+    }
+  }
+  return paths
+}
+
+type ArtifactParity = { mismatch: boolean, complete: boolean, evidence: string[] }
+
+function composeArtifact(value: Record<string, unknown>): string | null {
+  if (typeof value.image === 'string') return `image:${value.image}`
+  if (typeof value.build === 'string') return `build:${value.build}/Dockerfile`
+  if (isRecord(value.build)) {
+    const context = typeof value.build.context === 'string' ? value.build.context : '.'
+    const dockerfile = typeof value.build.dockerfile === 'string' ? value.build.dockerfile : 'Dockerfile'
+    return `build:${context}/${dockerfile}`
+  }
+  return null
+}
+
+function workerArtifactParity(context: ScanContext): ArtifactParity {
+  const evidence: string[] = []
+  let complete = true
+  let mismatch = false
+  if (workerDefinitions(context).includes('railway.worker.toml')) {
+    const web = context.readText('railway.toml')
+    const worker = context.readText('railway.worker.toml')
+    if (!web?.trim() || !worker?.trim()) complete = false
+    else {
+      const webArtifact = web.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1] ?? 'Dockerfile'
+      const workerArtifact = worker.match(/dockerfilePath\s*=\s*["']([^"']+)["']/i)?.[1] ?? 'Dockerfile'
+      evidence.push(webArtifact === workerArtifact ? 'Railway web and worker select the same Dockerfile path.' : 'Railway web and worker select different Dockerfile paths.')
+      if (webArtifact !== workerArtifact) mismatch = true
+    }
+  }
+  const compose = context.readText('docker-compose.fullapp.yml')
+  if (compose) {
+    try {
+      const root: unknown = parse(compose, { merge: true })
+      if (isRecord(root) && isRecord(root.services)) {
+        const services = Object.entries(root.services).filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]))
+        const workers = services.filter(([, value]) => {
+          const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
+          return isWorkerCommand(command)
+        })
+        if (workers.length) {
+          const web = services.find(([name, value]) => {
+            const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
+            return !isWorkerCommand(command) && /^(?:app|web|mercato)$/i.test(name)
+          })
+          if (!web) complete = false
+          else {
+            const webArtifact = composeArtifact(web[1])
+            if (!webArtifact) complete = false
+            for (const [, value] of workers) {
+              const workerArtifact = composeArtifact(value)
+              if (!workerArtifact) complete = false
+              else {
+                evidence.push(webArtifact === workerArtifact ? 'Compose web and worker select the same artifact.' : 'Compose web and worker select different artifacts.')
+                if (webArtifact !== workerArtifact) mismatch = true
+              }
+            }
+          }
+        }
+      }
+    } catch {
+      complete = false
+    }
+  }
+  if (workerDefinitions(context).includes('scripts/railway-worker.sh')) complete = false
+  return { mismatch, complete, evidence }
+}
+
+function finalDockerUser(source: string): string | null {
+  const lines = source.split(/\r?\n/)
+  const stages = new Map<string, { user: string | null }>()
+  let current: { user: string | null } | null = null
+  let stageIndex = 0
+  for (const line of lines) {
+    const from = line.match(/^\s*FROM\s+(?:--platform=\S+\s+)?([^\s]+)(?:\s+AS\s+([^\s#]+))?/i)
+    if (from?.[1]) {
+      const inherited = stages.get(from[1].toLowerCase())?.user ?? null
+      current = { user: inherited }
+      stages.set(String(stageIndex), current)
+      if (from[2]) stages.set(from[2].toLowerCase(), current)
+      stageIndex += 1
+      continue
+    }
+    const user = line.match(/^\s*USER\s+([^\s#]+)/i)?.[1]
+    if (current && user) current.user = user.toLowerCase()
+  }
+  return current?.user ?? null
+}
+
+type WorkflowCommand = { command: string, blocking: boolean }
+
+function constantBoolean(value: unknown, expected: boolean): boolean {
+  if (value === expected) return true
+  if (typeof value !== 'string') return false
+  const token = expected ? 'true' : 'false'
+  return new RegExp(`^(?:${token}|\\$\\{\\{\\s*${token}\\s*\\}\\})$`, 'i').test(value.trim())
+}
+
+function alwaysRuns(value: unknown): boolean {
+  return value === undefined || constantBoolean(value, true)
+}
+
+function failureIsBlocking(value: unknown): boolean {
+  return value === undefined || constantBoolean(value, false)
+}
+
+function shellPreservesFailure(value: unknown): boolean {
+  if (value === undefined) return true
+  if (typeof value !== 'string') return false
+  const tokens = value.trim().split(/\s+/)
+  const executable = tokens[0]?.split('/').at(-1)?.toLowerCase()
+  if (executable !== 'bash' && executable !== 'sh') return false
+  return tokens.some((token) => /^-[^-]*e[A-Za-z]*$/.test(token)) || /(?:^|\s)-o\s+errexit(?:\s|$)/i.test(value)
+}
+
+function workflowCommands(source: string): WorkflowCommand[] {
+  const commands: WorkflowCommand[] = []
+  for (const document of parseAllDocuments(source)) {
+    if (document.errors.length) continue
+    const root: unknown = document.toJS()
+    if (!isRecord(root) || !isRecord(root.jobs)) continue
+    const workflowDefaults = isRecord(root.defaults) && isRecord(root.defaults.run) ? root.defaults.run : null
+    for (const value of Object.values(root.jobs)) {
+      if (!isRecord(value) || !Array.isArray(value.steps)) continue
+      const jobRuns = alwaysRuns(value.if)
+      const jobBlocking = failureIsBlocking(value['continue-on-error'])
+      const jobDefaults = isRecord(value.defaults) && isRecord(value.defaults.run) ? value.defaults.run : workflowDefaults
+      for (const step of value.steps) {
+        if (!isRecord(step) || typeof step.run !== 'string') continue
+        const runs = jobRuns && alwaysRuns(step.if)
+        const shell = step.shell ?? jobDefaults?.shell
+        const blocking = jobBlocking && failureIsBlocking(step['continue-on-error']) && shellPreservesFailure(shell)
+        if (runs && step.run.trim()) commands.push({ command: step.run, blocking })
+      }
+    }
+  }
+  return commands
+}
+
+function hasBlockingPackageCommand(commands: WorkflowCommand[], name: string): boolean {
+  const pattern = new RegExp(`(?:^|[;&|]\\s*)(?:corepack\\s+)?(?:yarn(?:\\s+run)?|pnpm(?:\\s+run)?|npm(?:\\s+run)?)\\s+${name}\\b`, 'im')
+  return commands.some(({ command, blocking }) => blocking && commandPreservesFailure(command) && pattern.test(command))
+}
+
+function hasBlockingMigrationCommand(commands: WorkflowCommand[]): boolean {
+  return commands.some(({ command, blocking }) => blocking && commandPreservesFailure(command) && /(?:^|[;&|]\s*)(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)\b/im.test(command))
+}
+
+function commandPreservesFailure(command: string): boolean {
+  return !/\||\bset\s+\+e\b|;\s*exit\s+0\b/i.test(command)
+}
+
+function finalDependencyInstallIsImmutable(context: ScanContext): boolean {
+  const source = executableDeploymentText(context)
+  const installs = [...source.matchAll(/\b(yarn\s+install\b[^\n;&|]*|npm\s+(?:ci|install)\b[^\n;&|]*|pnpm\s+install\b[^\n;&|]*)/gi)]
+    .map((match) => match[1]?.trim() ?? '')
+    .filter(Boolean)
+  const finalInstall = installs.at(-1)
+  if (!finalInstall) return false
+  return /^npm\s+ci\b/i.test(finalInstall)
+    || /^yarn\s+install\b[^\n]*\s--(?:immutable|frozen-lockfile)(?:\s|$)/i.test(finalInstall)
+    || /^pnpm\s+install\b[^\n]*\s--frozen-lockfile(?:\s|$)/i.test(finalInstall)
+}
+
+function requiresNode24OrNewer(range: string): boolean {
+  if (range.split('||').some((clause) => !clause.trim())) return false
+  if (validRange(range) === null) return false
+  const minimum = minVersion(range)
+  return minimum !== null && minimum.major >= 24
 }
 
 export const RULES: readonly RuleDefinition[] = [
@@ -146,7 +428,7 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Remove tracked credential or private-key files, revoke or rotate the material, and store it in an access-controlled secret manager.',
     check: (context) => {
       if (!context.trackedFiles) return { status: 'warning', summary: 'Git tracking could not be inspected; verify that no credential or private-key file is committed.' }
-      const tracked = [...context.trackedFiles].filter(trackedCredentialPath).sort()
+      const tracked = [...context.trackedFiles].filter(isCredentialPath).sort()
       return tracked.length
         ? { status: 'fail', summary: 'Credential-like or private-key paths are tracked.', evidence: tracked.map((file) => `Tracked sensitive path: ${displayPath(file)}`) }
         : { status: 'pass', summary: 'No recognized credential or private-key path is tracked.' }
@@ -184,7 +466,9 @@ export const RULES: readonly RuleDefinition[] = [
       const values = scripts(context)
       const missing = ['build', 'start'].filter((name) => !values[name])
       if (missing.length) return { status: 'fail', summary: 'Production lifecycle scripts are incomplete.', evidence: missing.map((name) => `Missing package script: ${name}`) }
-      if (!/NODE_ENV=production/.test(values.build ?? '')) return { status: 'fail', summary: 'The build script does not explicitly force NODE_ENV=production.' }
+      const build = values.build ?? ''
+      const productionBuild = /(?:^|&&|;)\s*(?:cross-env\s+)?NODE_ENV=production\s+(?:(?:next|mercato)\s+build|(?:yarn|pnpm|npm(?:\s+run)?)\s+build(?::[A-Za-z0-9_-]+)?)(?:\s|$)/i.test(build)
+      if (!productionBuild) return { status: 'fail', summary: 'The build script does not explicitly force NODE_ENV=production for the build command.' }
       return { status: 'pass', summary: 'Production build and start scripts are present and production mode is explicit.' }
     },
   }),
@@ -229,10 +513,11 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'edge-security-headers', title: 'Application security headers are configured', category: 'Edge', severity: 'high',
     remediation: 'Keep the shared CSP and security headers in next.config.ts and verify that the public edge preserves them.',
     check: (context) => {
-      const source = context.readText('next.config.ts') ?? context.readText('next.config.mjs') ?? ''
+      const source = uncommented(context.readText('next.config.ts') ?? context.readText('next.config.mjs') ?? '')
       const required = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options']
       const missing = required.filter((header) => !source.includes(header))
       if (!/X-Frame-Options|frame-ancestors/.test(source)) missing.push('frame protection')
+      if (!/(?:async\s+)?headers\s*\(\s*\)\s*\{|headers\s*:\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>)/m.test(source)) missing.push('active Next.js headers configuration')
       return missing.length
         ? { status: 'fail', summary: 'The application configuration does not declare the complete security-header baseline.', evidence: missing.map((header) => `Missing header: ${header}`) }
         : { status: 'pass', summary: 'The application declares CSP, referrer, frame, and MIME-sniffing protection headers.' }
@@ -267,8 +552,10 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const source = context.readText('Dockerfile')
       if (!source) return { status: 'skipped', summary: 'No Dockerfile is present.' }
-      const users = [...source.matchAll(/^USER\s+([^\s#]+)/gmi)].map((match) => match[1]?.toLowerCase()).filter(Boolean)
-      return users.length > 0 && users.at(-1) !== 'root' && users.at(-1) !== '0'
+      const user = finalDockerUser(source)
+      const userId = user?.split(':', 1)[0] ?? ''
+      const nonRoot = userId !== '' && !/[${}]/.test(userId) && userId !== 'root' && !/^0+$/.test(userId)
+      return nonRoot
         ? { status: 'pass', summary: 'The final container user is non-root.', evidence: ['A final USER directive is present.'] }
         : { status: 'fail', summary: 'The production image does not end with a non-root USER directive.' }
     },
@@ -276,7 +563,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'supply-chain-immutable-install', title: 'Deployments use immutable dependency installation', category: 'Supply chain', severity: 'high',
     remediation: 'Commit one lockfile and use an immutable/frozen install in image and CI builds.',
-    check: (context) => /yarn\s+install\s+--immutable|npm\s+ci\b|pnpm\s+install\s+--frozen-lockfile/i.test(context.collectDeploymentText())
+    check: (context) => finalDependencyInstallIsImmutable(context)
       ? { status: 'pass', summary: 'Deployment configuration uses an immutable dependency install.' }
       : { status: 'fail', summary: 'No immutable dependency installation was found in deployment configuration.' },
   }),
@@ -294,7 +581,7 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'infrastructure-shared-redis', title: 'Multi-process deployments use shared Redis coordination', category: 'Infrastructure', severity: 'high',
     remediation: 'Use shared Redis-backed cache, events, and asynchronous queues whenever web and worker processes run separately.',
     check: (context) => {
-      const hasWorker = ['railway.worker.toml', 'scripts/railway-worker.sh'].some(context.exists)
+      const hasWorker = workerDefinitions(context).length > 0
       if (!hasWorker) return { status: 'skipped', summary: 'No separate worker process was detected.' }
       const inventory = templateInventory(context)
       const strategy = inventory.enums.get('CACHE_STRATEGY')
@@ -307,7 +594,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'release-database-migrations', title: 'Database migrations are part of release startup', category: 'Release', severity: 'high',
     remediation: 'Run the supported database migration command once per release before accepting traffic.',
-    check: (context) => /(?:db[: ]migrate|mercato\s+db\s+migrate)/i.test(context.collectDeploymentText())
+    check: (context) => /(?:db[: ]migrate|mercato\s+db\s+migrate)/i.test(executableDeploymentText(context))
       ? { status: 'warning', summary: 'A migration path exists; verify exactly one controlled release job can execute it.' }
       : { status: 'fail', summary: 'No database migration step was found in deployment configuration.' },
   }),
@@ -320,10 +607,10 @@ export const RULES: readonly RuleDefinition[] = [
       const images = [...source.matchAll(/^\s*image\s*[:=]\s*["']?([^\s"']+)/gmi)].map((match) => match[1] ?? '')
       if (!images.length) return { status: 'warning', summary: 'No in-repository production image reference proves immutable artifact selection.' }
       const mutable = images.filter((image) => /:latest$|:(?:main|master|develop|dev)$/i.test(image))
-      if (mutable.length) return { status: 'fail', summary: 'Production configuration uses mutable image references.', evidence: ['A recognized deployment file selects a mutable image tag.'] }
+      if (mutable.length) return { status: 'fail', summary: 'Production configuration uses mutable image references.', evidence: ['At least one configured image uses a mutable channel tag.'] }
       const unpinned = images.filter((image) => !/@sha256:[a-f0-9]{64}$/i.test(image) && !/:[a-f0-9]{7,40}$/i.test(image) && !/github\.sha/i.test(image))
       return unpinned.length
-        ? { status: 'warning', summary: 'Image references exist, but the scanner cannot prove they are immutable.', evidence: ['A recognized deployment file selects an image without a digest or commit identifier.'] }
+        ? { status: 'warning', summary: 'Image references exist, but the scanner cannot prove they are immutable.', evidence: ['At least one configured image lacks a recognized digest or commit-derived identifier.'] }
         : { status: 'pass', summary: 'Production image references use a digest or commit-derived identifier.' }
     },
   }),
@@ -333,14 +620,14 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const source = context.collectCiText()
       if (!source) return { status: 'warning', summary: 'No recognized in-repository CI workflow was found; verify the external release gate.' }
+      const commands = workflowCommands(source)
       const required = [
-        ['generation', /(?:yarn|npm|pnpm).*\bgenerate\b/i],
-        ['production build', /(?:yarn|npm|pnpm).*\bbuild\b/i],
-        ['tests', /(?:yarn|npm|pnpm).*\btest\b/i],
-        ['migration verification', /migrat/i],
+        ['generation', hasBlockingPackageCommand(commands, 'generate')],
+        ['production build', hasBlockingPackageCommand(commands, 'build')],
+        ['tests', hasBlockingPackageCommand(commands, 'test')],
+        ['migration verification', hasBlockingMigrationCommand(commands)],
       ] as const
-      const missing = required.filter(([, pattern]) => !pattern.test(source)).map(([name]) => name)
-      if (/continue-on-error:\s*true/i.test(source)) return { status: 'fail', summary: 'The CI workflow contains a permissive continue-on-error step that requires review.' }
+      const missing = required.filter(([, present]) => !present).map(([name]) => name)
       return missing.length
         ? { status: 'fail', summary: 'The release validation workflow is incomplete.', evidence: missing.map((name) => `Missing blocking stage: ${name}`) }
         : { status: 'pass', summary: 'CI represents generation, build, tests, and migration verification.' }
@@ -351,7 +638,7 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Deploy the supported worker process separately, keep its release aligned with the web app, and monitor both.',
     check: (context) => {
       if (!dependencies(context).has('@open-mercato/queue')) return { status: 'skipped', summary: 'The queue package is not installed.' }
-      const paths = ['railway.worker.toml', 'scripts/railway-worker.sh', 'docker-compose.fullapp.yml'].filter(context.exists)
+      const paths = workerDefinitions(context)
       return paths.length
         ? { status: 'pass', summary: 'An explicit worker deployment surface is present.', evidence: fileEvidence(paths) }
         : { status: 'fail', summary: 'The queue package is installed but no worker deployment surface was found.' }
@@ -361,12 +648,11 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'workers-release-parity', title: 'Web and worker processes use the same release artifact', category: 'Operations', severity: 'high',
     remediation: 'Deploy one immutable build to web and worker roles and vary only the supported entrypoint.',
     check: (context) => {
-      if (!context.exists('railway.worker.toml') && !context.exists('scripts/railway-worker.sh')) return { status: 'skipped', summary: 'No separate worker process was detected.' }
-      const dockerfiles = workerDockerfiles(context)
-      if (dockerfiles.length < 2) return { status: 'warning', summary: 'Worker deployment exists, but artifact parity is controlled outside recognized repository files.' }
-      return new Set(dockerfiles).size === 1
-        ? { status: 'pass', summary: 'Web and worker deployment definitions use the same Dockerfile.', evidence: ['railway.toml and railway.worker.toml select the same Dockerfile path.'] }
-        : { status: 'fail', summary: 'Web and worker deployment definitions use different build artifacts.', evidence: ['railway.toml and railway.worker.toml select different Dockerfile paths.'] }
+      if (workerDefinitions(context).length === 0) return { status: 'skipped', summary: 'No separate worker process was detected.' }
+      const parity = workerArtifactParity(context)
+      if (parity.mismatch) return { status: 'fail', summary: 'Web and worker deployment definitions use different build artifacts.', evidence: parity.evidence }
+      if (!parity.complete) return { status: 'warning', summary: 'Worker deployment exists, but artifact parity cannot be proved across every detected surface.', evidence: parity.evidence }
+      return { status: 'pass', summary: 'Every detected web and worker deployment surface uses the same artifact.', evidence: parity.evidence }
     },
   }),
   rule({
@@ -415,7 +701,7 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const engines = context.packageJson.engines
       const node = engines && typeof engines === 'object' && !Array.isArray(engines) ? (engines as Record<string, unknown>).node : undefined
-      return typeof node === 'string' && /(?:>=|\^|~)?\s*2[4-9]/.test(node)
+      return typeof node === 'string' && requiresNode24OrNewer(node)
         ? { status: 'pass', summary: 'package.json requires Node.js 24 or newer.', evidence: ['A supported Node.js engine constraint is declared.'] }
         : { status: 'fail', summary: 'package.json does not require a supported Node.js runtime.' }
     },
@@ -426,8 +712,6 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const inventory = templateInventory(context)
       const risky = [...inventory.booleans].filter(([, enabled]) => enabled).map(([key]) => key)
-      const autologin = [...inventory.names].filter((key) => /AUTOLOGIN/.test(key))
-      risky.push(...autologin.filter((key) => !risky.includes(key)))
       return risky.length === 0
         ? { status: 'warning', summary: 'No development-only switch defaults to enabled in .env.example; verify the live environment separately.' }
         : { status: 'fail', summary: 'Development-only switches default to enabled.', evidence: risky.map((key) => `Enabled template switch: ${key}`) }

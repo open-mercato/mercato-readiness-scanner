@@ -141,7 +141,7 @@ npm install --global @open-mercato/readiness-scanner
 mercato-readiness scan . --fail-on high
 ```
 
-The published package contains compiled JavaScript and TypeScript declarations and has no runtime dependencies. Its programmatic entry point exports `scan`, formatters, types, and the rule catalog.
+The published package contains compiled JavaScript and TypeScript declarations and uses YAML and semantic-version parsers for configuration checks. Its programmatic entry point exports `scan`, formatters, types, and the rule catalog.
 
 ## Documentation
 

@@ -1,6 +1,6 @@
 # Development and releases
 
-Use Node.js 24+ and npm. There are no runtime dependencies.
+Use Node.js 24+ and npm. Runtime dependencies are limited to YAML and semantic-version parsers; the installed CLI does not require TypeScript or tsx.
 
 ```bash
 npm ci
@@ -17,6 +17,7 @@ npm run test:standalone
 | `npm run test:unit` | Rule, environment-parser, and safe-file unit tests |
 | `npm run test:integration` | Fixture scans, CLI behavior, redaction, permission checks, and schema validation |
 | `npm run build` | Compile runtime code and declarations; mark CLI executable |
+| `npm run test:built` | Check compiled CLI policies and block repository fsmonitor execution |
 | `npm run pack:check` | Check publish inventory and executable permissions |
 | `npm run test:standalone` | Generate app, install packed CLI, save security reports |
 

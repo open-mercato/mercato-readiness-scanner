@@ -64,8 +64,8 @@ export const FILES: Readonly<Record<string, string>> = {
     '.ai/session-exports/',
   ].join('\n'),
   'next.config.ts': [
-    "const headers = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options', 'X-Frame-Options']",
-    'export default { headers }',
+    "const securityHeaders = ['Content-Security-Policy', 'Referrer-Policy', 'X-Content-Type-Options', 'X-Frame-Options']",
+    'export default { async headers() { return [{ source: "/:path*", headers: securityHeaders }] } }',
   ].join('\n'),
   Dockerfile: [
     'FROM node:24-alpine',
@@ -77,7 +77,7 @@ export const FILES: Readonly<Record<string, string>> = {
   'railway.worker.toml': '[deploy]\nstartCommand = "yarn mercato worker"\n',
   'docker-compose.fullapp.yml': 'services:\n  app:\n    volumes:\n      - uploads:/app/storage\nvolumes:\n  uploads:\n',
   'docker/otel-collector-config.yaml': 'receivers:\n  otlp:\nexporters:\n  debug:\n',
-  '.github/workflows/release.yml': 'steps:\n  - run: yarn generate\n  - run: yarn build\n  - run: yarn test\n  - run: yarn db:migrate --check\n',
+  '.github/workflows/release.yml': 'jobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n',
   'docs/operations.md': [
     '# Production operations',
     'Use TLS and HTTPS with certificate renewal and the canonical origin.',

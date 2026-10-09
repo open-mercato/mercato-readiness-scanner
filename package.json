@@ -9,7 +9,13 @@
   },
   "homepage": "https://github.com/open-mercato/mercato-readiness-scanner#readme",
   "bugs": "https://github.com/open-mercato/mercato-readiness-scanner/issues",
-  "keywords": ["open-mercato", "security", "readiness", "cli", "typescript"],
+  "keywords": [
+    "open-mercato",
+    "security",
+    "readiness",
+    "cli",
+    "typescript"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -41,12 +47,13 @@
     "typecheck": "tsc -p tsconfig.check.json",
     "test": "npm run test:unit && npm run test:integration",
     "test:unit": "node --import tsx --test test/unit/*.test.ts",
-    "test:integration": "node --import tsx --test test/scanner.test.ts test/cli.test.ts",
+    "test:integration": "node --import tsx --test test/*.test.ts",
     "test:standalone": "npm run build && node --import tsx --test test/standalone/*.test.ts",
     "pack:check": "node --import tsx scripts/check-package.ts",
     "prepack": "npm run build",
     "prepublishOnly": "npm run check && npm run test:standalone",
-    "check": "npm run lint && npm run typecheck && npm test && npm run build && npm run pack:check"
+    "check": "npm run lint && npm run typecheck && npm test && npm run build && npm run test:built && npm run pack:check",
+    "test:built": "node --import tsx --test test-built/*.test.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -57,6 +64,11 @@
     "jiti": "^2.7.0",
     "tsx": "^4.7.0",
     "typescript": "^6.0.3",
-    "typescript-eslint": "^8.71.1"
+    "typescript-eslint": "^8.71.1",
+    "@types/semver": "^7.8.0"
+  },
+  "dependencies": {
+    "semver": "^7.8.5",
+    "yaml": "^2.9.1"
   }
 }

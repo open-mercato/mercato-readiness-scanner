@@ -51,7 +51,7 @@ test('collects workflow text in a stable order and excludes secret directories',
     fs.writeFileSync(path.join(workflows, 'z.yml'), 'last')
     fs.writeFileSync(path.join(workflows, 'a.yml'), 'first')
     fs.writeFileSync(path.join(workflows, 'secrets', 'values.yml'), 'MUST_NOT_READ')
-    assert.equal(collectCiText(root), 'first\nlast')
+    assert.equal(collectCiText(root), 'first\n---\nlast')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
