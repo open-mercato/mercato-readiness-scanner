@@ -838,7 +838,7 @@ function exportedConfigObject(source: string): { body: string, start: number } |
   if (body === null) return null
   const afterObject = source.slice(openingBrace + body.length + 2)
   const identifierPattern = escapedIdentifier(identifier)
-  const headerKeyPattern = '(?:["\']headers["\']|`headers`|[A-Za-z_$][\\w$]*)'
+  const headerKeyPattern = '(?:["\']headers["\']|`headers`|\\[\\s*(?:["\']headers["\']|`headers`)\\s*]|[A-Za-z_$][\\w$]*)'
   const mutation = new RegExp([
     `\\b${identifierPattern}\\s*(?:\\.\\s*headers|\\[\\s*${headerKeyPattern}\\s*])\\s*=`,
     `\\bdelete\\s+${identifierPattern}\\s*(?:\\.\\s*headers|\\[\\s*${headerKeyPattern}\\s*])`,

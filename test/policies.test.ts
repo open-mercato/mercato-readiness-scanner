@@ -516,6 +516,8 @@ test('requires effective worker and command evidence instead of comments or empt
     assert.equal(status(root, 'edge-security-headers'), 'fail')
     overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; Reflect.defineProperty(config, "headers", { value: undefined }); export default config\n`)
     assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; Object.defineProperty(config, ["headers"], { value: undefined }); export default config\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
     overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; Object.defineProperty(config, \`headers\`, { value: undefined }); export default config\n`)
     assert.equal(status(root, 'edge-security-headers'), 'fail')
     overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; delete config["images"]; export default config\n`)
