@@ -853,7 +853,7 @@ function constantStringValue(expression: string): string | null {
     const escaped = body[index + 1]
     if (escaped === undefined) return null
     index += 1
-    if (escaped === '\n') continue
+    if (escaped === '\n' || escaped === '\u2028' || escaped === '\u2029') continue
     if (escaped === '\r') {
       if (body[index + 1] === '\n') index += 1
       continue
