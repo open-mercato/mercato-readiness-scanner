@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { collectCiText, collectCiWorkflows, collectDeploymentText, existsInside, gitTrackedFiles, readSafeText } from './files.js'
+import { collectCiText, collectCiWorkflows, collectDeploymentText, collectOperationalDocs, existsInside, gitTrackedFiles, readSafeText } from './files.js'
 import type { ScanContext } from './types.js'
 
 function readPackageJson(directory: string): Record<string, unknown> | null {
@@ -53,6 +53,7 @@ export function createScanContext(root: string): ScanContext {
     exists: (relativePath) => existsInside(root, relativePath),
     readText: (relativePath) => readSafeText(root, relativePath),
     collectDeploymentText: () => collectDeploymentText(root),
+    collectOperationalDocs: () => collectOperationalDocs(root),
     collectCiText: () => collectCiText(root),
     collectCiWorkflows: () => collectCiWorkflows(root),
   }

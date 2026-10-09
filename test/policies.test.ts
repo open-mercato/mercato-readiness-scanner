@@ -156,6 +156,7 @@ test('counts only active blocking workflow commands as release validation', () =
       'jobs:',
       '  validate:',
       '    steps:',
+      '      - uses: actions/checkout@v4',
       '      - run: yarn generate',
       '      - run: yarn build',
       '      - run: yarn test || true',
@@ -318,6 +319,7 @@ test('counts only active blocking workflow commands as release validation', () =
       'jobs:',
       '  validate:',
       '    steps:',
+      '      - uses: actions/checkout@v4',
       '      - run: yarn generate',
       '      - run: yarn build',
       '      - run: yarn test',
@@ -434,6 +436,8 @@ test('requires effective worker and command evidence instead of comments or empt
       overwrite(root, 'railway.toml', `[deploy]\nstartCommand = "${command}"\n`)
       assert.equal(status(root, 'release-database-migrations'), 'fail', command)
     }
+    overwrite(root, 'railway.toml', '[deploy]\nstartCommand = "/bin/false && yarn db:migrate"\n')
+    assert.equal(status(root, 'release-database-migrations'), 'fail')
     for (const healthcheck of [
       'healthcheck:\n      disable: true\n      test: ["CMD", "curl", "http://localhost:3000/api/healthz"]',
       'healthcheck:\n      test: ["CMD-SHELL", "echo curl http://localhost:3000/api/healthz"]',
@@ -498,6 +502,10 @@ test('requires effective worker and command evidence instead of comments or empt
     assert.equal(status(root, 'edge-security-headers'), 'fail')
     overwrite(root, 'next.config.ts', 'export default { async headers() { return [{ source: "/:path*", headers: [{ key: "Content-Security-Policy", value: true }, { key: "Referrer-Policy", value: false }, { key: "X-Content-Type-Options", value: 1 }] }] }\n')
     assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `const effectiveKey = "headers"; const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; config[effectiveKey] = undefined; export default config\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `const config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; Object.assign(config, { headers: undefined }); export default config\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
 
     const validTemplate = fs.readFileSync(path.join(root, '.env.example'), 'utf8')
     overwrite(root, '.env.example', validTemplate.replace('RATE_LIMIT_TRUST_PROXY_DEPTH=1', 'RATE_LIMIT_TRUST_PROXY_DEPTH=unbounded'))
@@ -508,10 +516,29 @@ test('requires effective worker and command evidence instead of comments or empt
 
     overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:stable\n')
     assert.equal(status(root, 'release-immutable-artifact'), 'fail')
+    overwrite(root, 'docker-compose.yml', 'services:\n  app:\n    image: app:github.sha\n')
+    assert.equal(status(root, 'release-immutable-artifact'), 'fail')
     overwrite(root, 'docker-compose.yml', '')
     overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    volumes: ["/tmp/cache:/tmp/cache"]\n')
     overwrite(root, 'docs/operations.md', 'TLS HTTPS certificate backup restore rollback worker\n')
     assert.equal(status(root, 'storage-persistent-volume'), 'fail')
+
+    overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    healthcheck:\n      test: ["CMD", "curl", "http://localhost:3000/api/healthz"]\n')
+    assert.equal(status(root, 'operations-health-check'), 'fail')
+    overwrite(root, 'docker-compose.fullapp.yml', 'services:\n  app:\n    healthcheck:\n      test: ["CMD", "curl", "--fail", "http://localhost:3000/api/healthz"]\n')
+    assert.equal(status(root, 'operations-health-check'), 'warning')
+
+    overwrite(root, 'Dockerfile', 'FROM node:24 AS mutable\nRUN npm install\nFROM node:24 AS decoy\nRUN npm ci\nFROM mutable AS runtime\nUSER app\n')
+    assert.equal(status(root, 'supply-chain-immutable-install'), 'fail')
+
+    overwrite(root, '.github/workflows/release.yml', 'on:\n  push:\n    branches: [main]\njobs:\n  validate:\n    steps:\n      - uses: actions/checkout@v4\n        with:\n          ref: main\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n')
+    assert.equal(status(root, 'release-validation-gate'), 'fail')
+
+    overwrite(root, 'Dockerfile', 'FROM node:24\n# TODO configure TLS, backup, restore, and rollback\nRUN yarn install --immutable\nUSER app\n')
+    overwrite(root, 'docs/operations.md', '')
+    assert.equal(status(root, 'edge-tls-and-canonical-origin'), 'fail')
+    assert.equal(status(root, 'data-backup-restore-runbook'), 'fail')
+    assert.equal(status(root, 'release-rollback-runbook'), 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
     assert.equal(status(root, 'supply-chain-immutable-install'), 'fail')

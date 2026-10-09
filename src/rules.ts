@@ -293,7 +293,9 @@ function executableHealthCheck(value: Record<string, unknown>): boolean {
   if (!parts.length) return false
   const command = parts.filter((entry, index) => index > 0 || !/^(?:CMD|CMD-SHELL)$/i.test(entry.trim())).join(' ').trim()
   if (!command || !commandPreservesFailure(command) || hasNonExecutingFlag(command)) return false
-  return /^(?:(?:sh|bash)\s+(?:-[A-Za-z]*e[A-Za-z]*\s+)?-c\s+)?(?:curl|wget)\b[^\r\n;&|]*\/api\/healthz\b/i.test(command)
+  const executable = command.replace(/^(?:sh|bash)\s+(?:-[A-Za-z]*e[A-Za-z]*\s+)?-c\s+/i, '')
+  if (/^wget\b[^\r\n;&|]*\/api\/healthz\b/i.test(executable)) return true
+  return /^curl\b(?=[^\r\n;&|]*(?:--fail(?:-with-body)?\b|-[A-Za-z]*f[A-Za-z]*\b))[^\r\n;&|]*\/api\/healthz\b/i.test(executable)
 }
 
 function configuredHealthCheck(context: ScanContext): boolean {
@@ -316,7 +318,7 @@ function executableMigrationCommand(command: string): boolean {
   const segments = normalized.split(/\s*&&\s*|\r?\n/).map((segment) => segment.trim()).filter(Boolean)
   const migrationIndex = segments.findIndex((segment) => /^(?:exec\s+)?(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)(?:\s+[^;&|<\r\n]+)?$/i.test(segment))
   if (migrationIndex < 0) return false
-  return !segments.slice(0, migrationIndex).some((segment) => /^(?:false|exit\b|return\b|exec\b)/i.test(segment))
+  return !segments.slice(0, migrationIndex).some((segment) => /^(?:(?:\/[^\s/]+)*\/false\b|false\b|exit\b|return\b|exec\b)/i.test(segment))
 }
 
 function configuredMigration(context: ScanContext): boolean {
@@ -586,6 +588,15 @@ function workflowJobs(workflow: string, source: string): WorkflowJob[] {
       const jobRuns = alwaysRuns(value.if)
       const jobBlocking = failureIsBlocking(value['continue-on-error'])
       if (!jobRuns || !jobBlocking) continue
+      const checkoutSteps = value.steps.filter((step) => isRecord(step) && typeof step.uses === 'string' && /^actions\/checkout@/i.test(step.uses))
+      if (checkoutSteps.length === 0) continue
+      const checkoutIsExact = value.steps.every((step) => {
+        if (!isRecord(step) || typeof step.uses !== 'string' || !/^actions\/checkout@/i.test(step.uses)) return true
+        if (!isRecord(step.with) || step.with.ref === undefined) return true
+        if (typeof step.with.ref !== 'string') return false
+        return /^\$\{\{\s*github\.sha\s*\}\}$/i.test(step.with.ref.trim()) || /^[a-f0-9]{40}$/i.test(step.with.ref.trim())
+      })
+      if (!checkoutIsExact) continue
       const jobDefaults = isRecord(value.defaults) && isRecord(value.defaults.run) ? value.defaults.run : workflowDefaults
       const commands: WorkflowCommand[] = []
       for (const step of value.steps) {
@@ -666,13 +677,19 @@ function dependencyInstallationProof(context: ScanContext): { found: boolean, mu
   for (const file of DEPLOYMENT_FILES) {
     const source = uncommented(context.readText(file) ?? '').replace(/\\\r?\n/g, ' ')
     if (!source.trim()) continue
-    const mutations = source
-      .split(/\r?\n|&&|\|\||;|&|\|/)
-      .map(dependencyMutation)
-      .filter((value): value is DependencyMutation => value !== null)
+    const commands = source.split(/\r?\n|&&|\|\||;|&|\|/)
+    const mutations = commands.map(dependencyMutation).filter((value): value is DependencyMutation => value !== null)
     if (!mutations.length) continue
     found = true
-    if (mutations.at(-1) !== 'immutable') mutableSurfaces.push(file)
+    if (file === 'Dockerfile') {
+      const stages = source.split(/^\s*FROM\s+/gmi).slice(1)
+      const unsafeStage = stages.some((stage) => {
+        const stageMutations = stage.split(/\r?\n|&&|\|\||;|&|\|/)
+          .map(dependencyMutation).filter((value): value is DependencyMutation => value !== null)
+        return stageMutations.length > 0 && stageMutations.at(-1) !== 'immutable'
+      })
+      if (unsafeStage) mutableSurfaces.push(file)
+    } else if (mutations.at(-1) !== 'immutable') mutableSurfaces.push(file)
   }
   return { found, mutableSurfaces }
 }
@@ -779,7 +796,10 @@ function exportedConfigObject(source: string): { body: string, start: number } |
   const openingBrace = projection.indexOf('{', valueOffset)
   if (openingBrace !== valueOffset || projection.slice(valueOffset, openingBrace).trim()) return null
   const body = extractDelimitedBody(source, openingBrace, '{', '}')
-  return body === null ? null : { body, start: openingBrace }
+  if (body === null) return null
+  const afterObject = source.slice(openingBrace + body.length + 2)
+  const mutation = new RegExp(`(?:\\b${escapedIdentifier(identifier)}\\s*(?:\\[[^\\]]*]|\\.[A-Za-z_$][\\w$]*)\\s*=|\\b(?:Object\\s*\\.\\s*assign|Reflect\\s*\\.\\s*set)\\s*\\(\\s*${escapedIdentifier(identifier)}\\b)`, 'm')
+  return mutation.test(afterObject) ? null : { body, start: openingBrace }
 }
 
 function activeHeadersBody(configBody: string): string | null {
@@ -928,7 +948,7 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'edge-tls-and-canonical-origin', title: 'TLS and canonical origin are verified at deployment', category: 'Edge', severity: 'critical',
     remediation: 'Serve every public route over HTTPS, redirect HTTP, verify certificate renewal, and set the canonical public origin to the real HTTPS URL.',
     check: (context) => {
-      const source = context.collectDeploymentText()
+      const source = context.collectOperationalDocs()
       const hasTlsRunbook = /\b(?:https|tls|certificate)\b/i.test(source)
       return hasTlsRunbook
         ? { status: 'warning', summary: 'TLS guidance exists, but a static scan cannot verify the live certificate, redirect, DNS, or canonical origin.' }
@@ -1076,9 +1096,11 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const source = ['docker-compose.yml', 'docker-compose.fullapp.yml', 'railway.toml', 'railway.worker.toml']
         .map((file) => context.readText(file) ?? '').join('\n')
-      const images = [...source.matchAll(/^\s*image\s*[:=]\s*["']?([^\s"']+)/gmi)].map((match) => match[1] ?? '')
+      const images = [...source.matchAll(/^\s*image\s*[:=]\s*(?:"([^"]+)"|'([^']+)'|([^\s#]+))/gmi)]
+        .map((match) => match[1] ?? match[2] ?? match[3] ?? '')
       if (!images.length) return { status: 'warning', summary: 'No in-repository production image reference proves immutable artifact selection.' }
-      const unpinned = images.filter((image) => !/@sha256:[a-f0-9]{64}$/i.test(image) && !/:[a-f0-9]{7,40}$/i.test(image) && !/github\.sha/i.test(image))
+      const unpinned = images.filter((image) => !/@sha256:[a-f0-9]{64}$/i.test(image) && !/:[a-f0-9]{7,40}$/i.test(image)
+        && !/:\$\{\{\s*github\.sha\s*\}\}$/i.test(image))
       return unpinned.length
         ? { status: 'fail', summary: 'Production image references are not pinned to a digest or commit-derived identifier.', evidence: unpinned.map((image) => `Unpinned image reference: ${displayPath(image)}`) }
         : { status: 'pass', summary: 'Production image references use a digest or commit-derived identifier.' }
@@ -1149,7 +1171,7 @@ export const RULES: readonly RuleDefinition[] = [
     id: 'data-backup-restore-runbook', title: 'Backups and restore rehearsal are documented', category: 'Data', severity: 'critical',
     remediation: 'Document database and file backups, retention, encryption, off-site copies, restore ownership, and a dated restore rehearsal.',
     check: (context) => {
-      const source = context.collectDeploymentText()
+      const source = context.collectOperationalDocs()
       return containsAll(source.toLowerCase(), ['backup', 'restore'])
         ? { status: 'warning', summary: 'Backup and restore guidance exists; verify current off-site copies and a successful dated restore rehearsal.' }
         : { status: 'fail', summary: 'No backup-and-restore runbook was found.' }
@@ -1158,7 +1180,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'release-rollback-runbook', title: 'Rollback and forward-fix procedures are documented', category: 'Release', severity: 'high',
     remediation: 'Document immutable artifact rollback, database compatibility constraints, forward-fix ownership, and rollback verification.',
-    check: (context) => /\brollback\b|\bforward[- ]fix\b/i.test(context.collectDeploymentText())
+    check: (context) => /\brollback\b|\bforward[- ]fix\b/i.test(context.collectOperationalDocs())
       ? { status: 'warning', summary: 'Rollback guidance exists; rehearse it against the actual provider and database change policy.' }
       : { status: 'fail', summary: 'No rollback or forward-fix runbook was found.' },
   }),

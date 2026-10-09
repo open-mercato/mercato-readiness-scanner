@@ -46,6 +46,7 @@ export type ScanContext = {
   exists: (relativePath: string) => boolean
   readText: (relativePath: string) => string | null
   collectDeploymentText: () => string
+  collectOperationalDocs: () => string
   collectCiText: () => string
   collectCiWorkflows: () => ReadonlyArray<{ path: string, source: string }>
 }
