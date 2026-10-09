@@ -12,6 +12,8 @@ failures still return a healthy response.
 
 Configure the provider to probe `/api/healthz` with bounded timeouts and failure
 thresholds. Test healthy, dependency-failure, and recovery behavior, and add an
-external HTTPS monitor for the public route.
+external HTTPS monitor for the public route. The scanner recognizes structured
+Railway health-check configuration and Compose health-check commands; logging or
+echoing the route is not wiring.
 
 See [Make the deployment observable](https://docs.openmercato.com/deployment/production-readiness#ordered-production-checklist).

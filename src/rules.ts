@@ -2,7 +2,7 @@ import { isIP } from 'node:net'
 import { parseEnv } from 'node:util'
 import { minVersion, validRange } from 'semver'
 import { parse, parseAllDocuments } from 'yaml'
-import { isCredentialPath, isLiveEnvPath } from './files.js'
+import { gitignoredPaths, isCredentialPath, isLiveEnvPath } from './files.js'
 import type { RuleCheck, RuleDefinition, ScanContext, Severity } from './types.js'
 
 const DOCS_BASE = 'https://github.com/open-mercato/mercato-readiness-scanner/blob/main/docs/rules'
@@ -94,31 +94,9 @@ function missingSensitiveIgnoreCoverage(context: ScanContext): string[] {
     ['.npmrc', '.npmrc'],
     ['.ai/session-exports/', '.ai/session-exports/session.json'],
   ] as const
-  return probes.filter(([, path]) => !gitignoreMatches(source, path)).map(([pattern]) => pattern)
-}
-
-function gitignoreMatches(source: string, target: string): boolean {
-  let ignored = false
-  for (const rawLine of source.split(/\r?\n/)) {
-    const trimmed = rawLine.trim()
-    if (!trimmed || trimmed.startsWith('#')) continue
-    const negated = trimmed.startsWith('!')
-    let pattern = negated ? trimmed.slice(1) : trimmed
-    if (!pattern) continue
-    const directory = pattern.endsWith('/')
-    pattern = pattern.replace(/^\//, '').replace(/\/$/, '')
-    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replaceAll('**', '\u0000')
-      .replaceAll('*', '[^/]*')
-      .replaceAll('\u0000', '.*')
-      .replaceAll('?', '[^/]')
-    const anchored = pattern.includes('/')
-    const expression = directory
-      ? new RegExp(anchored ? `^${escaped}(?:/.*)?$` : `(?:^|/)${escaped}(?:/.*)?$`)
-      : new RegExp(anchored ? `^${escaped}$` : `(?:^|/)${escaped}$`)
-    if (expression.test(target)) ignored = !negated
-  }
-  return ignored
+  const ignored = gitignoredPaths(source, probes.map(([, path]) => path))
+  if (!ignored) return probes.map(([pattern]) => pattern)
+  return probes.filter(([, path]) => !ignored.has(path)).map(([pattern]) => pattern)
 }
 
 function unsafeTemplateValues(context: ScanContext): string[] {
@@ -140,6 +118,13 @@ function unsafeTemplateValues(context: ScanContext): string[] {
     if (placeholder.test(value)) continue
     try {
       const url = new URL(value)
+      const sensitiveParameter = [...url.searchParams.entries()].some(([name, parameter]) => sensitiveName.test(name) && !placeholder.test(parameter))
+      const fragmentParameters = new URLSearchParams(url.hash.replace(/^#/, ''))
+      const sensitiveFragment = [...fragmentParameters.entries()].some(([name, parameter]) => sensitiveName.test(name) && !placeholder.test(parameter))
+      if (sensitiveParameter || sensitiveFragment) {
+        unsafe.push(key)
+        continue
+      }
       const safeCredentials = (!url.username && !url.password)
         || (placeholder.test(decodeURIComponent(url.username)) && placeholder.test(decodeURIComponent(url.password)))
       if (safeHost(url.hostname) && safeCredentials) continue
@@ -269,17 +254,63 @@ function uncommented(source: string): string {
 const DEPLOYMENT_FILES = ['Dockerfile', 'railway.toml', 'railway.worker.toml', 'scripts/railway-start.sh', 'scripts/railway-worker.sh', 'docker/scripts/init-or-migrate.sh'] as const
 const COMPOSE_FILES = ['docker-compose.yml', 'docker-compose.fullapp.yml'] as const
 
-function executableDeploymentText(context: ScanContext): string {
-  return DEPLOYMENT_FILES
-    .map((file) => uncommented(context.readText(file) ?? ''))
-    .join('\n')
+function tomlString(source: string, field: string): string | null {
+  const match = new RegExp(`^\\s*${field}\\s*=\\s*["']([^"']+)["']\\s*$`, 'mi').exec(uncommented(source))
+  return match?.[1] ?? null
 }
 
-function isWorkerCommand(value: string): boolean {
+function configuredHealthCheck(context: ScanContext): boolean {
+  const railway = context.readText('railway.toml')
+  if (railway && tomlString(railway, 'healthcheckPath') === '/api/healthz') return true
+  for (const file of COMPOSE_FILES) {
+    const services = composeServices(context, file)
+    if (!services) continue
+    if (services.some(([, service]) => {
+      if (!isRecord(service.healthcheck)) return false
+      const test = service.healthcheck.test
+      const command = Array.isArray(test) ? test.join(' ') : String(test ?? '')
+      return /(?:curl|wget)[^\r\n]*\/api\/healthz\b/i.test(command)
+    })) return true
+  }
+  return false
+}
+
+function executableMigrationCommand(command: string): boolean {
+  const normalized = uncommented(command).trim()
+  if (!normalized || !commandPreservesFailure(normalized) || /<<|;/.test(normalized)) return false
+  return normalized.split(/\s*&&\s*|\r?\n/).some((segment) => /^(?:exec\s+)?(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)(?:\s+[^;&|<\r\n]+)?$/i.test(segment.trim()))
+}
+
+function configuredMigration(context: ScanContext): boolean {
+  const railway = context.readText('railway.toml')
+  const railwayCommand = railway ? tomlString(railway, 'startCommand') : null
+  if (railwayCommand && executableMigrationCommand(railwayCommand)) return true
+  for (const file of ['scripts/railway-start.sh', 'docker/scripts/init-or-migrate.sh'] as const) {
+    const source = context.readText(file)
+    if (source && executableMigrationCommand(source)) return true
+  }
+  for (const file of COMPOSE_FILES) {
+    const services = composeServices(context, file)
+    if (!services) continue
+    if (services.some(([, service]) => {
+      const command = Array.isArray(service.command) ? service.command.join(' ') : String(service.command ?? '')
+      return executableMigrationCommand(command)
+    })) return true
+  }
+  return false
+}
+
+function isWorkerCommand(context: ScanContext, value: string, seen = new Set<string>()): boolean {
   const normalized = value.trim()
-  return commandPreservesFailure(normalized)
-    && !hasNonExecutingFlag(normalized)
-    && /^(?:exec\s+)?(?:(?:yarn|pnpm)(?:\s+run)?\s+(?:mercato\s+)?worker|npm\s+run\s+(?:mercato\s+)?worker|mercato\s+worker)$/i.test(normalized)
+  if (!commandPreservesFailure(normalized) || hasNonExecutingFlag(normalized)) return false
+  if (/^(?:exec\s+)?(?:(?:yarn|pnpm)\s+mercato\s+worker|mercato\s+worker)$/i.test(normalized)) return true
+  const script = normalized.match(/^(?:exec\s+)?(?:npm\s+run|(?:yarn|pnpm)(?:\s+run)?)\s+([A-Za-z0-9:_-]+)$/i)?.[1]
+  if (!script || seen.has(script)) return false
+  const command = scripts(context)[script]
+  if (!command) return false
+  const nextSeen = new Set(seen)
+  nextSeen.add(script)
+  return isWorkerCommand(context, command, nextSeen)
 }
 
 function composeServices(context: ScanContext, file: string): Array<[string, Record<string, unknown>]> | null {
@@ -299,15 +330,15 @@ function workerDefinitions(context: ScanContext): string[] {
   const railway = context.readText('railway.worker.toml')
   if (railway) {
     const command = uncommented(railway).match(/(?:startCommand|command)\s*=\s*["']([^"']+)["']/i)?.[1]
-    if (command && isWorkerCommand(command)) paths.push('railway.worker.toml')
+    if (command && isWorkerCommand(context, command)) paths.push('railway.worker.toml')
   }
   const script = context.readText('scripts/railway-worker.sh')
-  if (script && isWorkerCommand(uncommented(script))) paths.push('scripts/railway-worker.sh')
+  if (script && isWorkerCommand(context, uncommented(script))) paths.push('scripts/railway-worker.sh')
   for (const file of COMPOSE_FILES) {
     const services = composeServices(context, file)
     if (services?.some(([, value]) => {
       const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
-      return isWorkerCommand(command)
+      return isWorkerCommand(context, command)
     })) paths.push(file)
   }
   return paths
@@ -357,11 +388,11 @@ function workerArtifactParity(context: ScanContext): ArtifactParity {
     }
     const workers = services.filter(([, value]) => {
       const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
-      return isWorkerCommand(command)
+      return isWorkerCommand(context, command)
     })
     const webs = services.filter(([name, value]) => {
       const command = Array.isArray(value.command) ? value.command.join(' ') : String(value.command ?? '')
-      return !isWorkerCommand(command) && /^(?:app|web|mercato)$/i.test(name)
+      return !isWorkerCommand(context, command) && /^(?:app|web|mercato)$/i.test(name)
     })
     if (!workers.length) {
       if (webs.length > 0 && workerDefinitions(context).length > 0) {
@@ -477,11 +508,20 @@ function releaseTrigger(value: unknown): boolean {
   if (!Object.hasOwn(value, 'push')) return false
   const push = value.push
   if (!isRecord(push)) return true
-  const configured = push.branches ?? push.tags
-  if (configured === undefined) return true
-  const filters = Array.isArray(configured) ? configured : [configured]
-  return filters.some((entry) => typeof entry === 'string'
-    && (/^(?:main|master|develop)$/.test(entry) || /[*?]/.test(entry) || entry.includes('[')))
+  const strings = (configured: unknown): string[] => (Array.isArray(configured) ? configured : [configured])
+    .filter((entry): entry is string => typeof entry === 'string')
+  const releaseBranches = new Set(['main', 'master', 'develop'])
+  const ignoredBranches = new Set(strings(push['branches-ignore']))
+  const branches = strings(push.branches)
+  const uncertainBranchIgnore = [...ignoredBranches].some((branch) => /[*?]/.test(branch) || branch.includes('['))
+  const branchPath = branches.length
+    ? branches.some((branch) => releaseBranches.has(branch))
+    : !uncertainBranchIgnore && [...releaseBranches].some((branch) => !ignoredBranches.has(branch))
+  const tags = strings(push.tags)
+  const ignoredTags = strings(push['tags-ignore'])
+  const tagPath = tags.some((tag) => /^(?:v|release[-/])(?:\d|\*|\[)/i.test(tag))
+    && !ignoredTags.some((tag) => /[*?]/.test(tag) || tag.includes('[') || /^(?:v|release[-/])\d/i.test(tag))
+  return branchPath || tagPath
 }
 
 function workflowJobs(workflow: string, source: string): WorkflowJob[] {
@@ -532,7 +572,7 @@ function commandPreservesFailure(command: string): boolean {
 }
 
 function hasNonExecutingFlag(command: string): boolean {
-  return /(?:^|\s)(?:--help|--version|-h|-v)(?:\s|$)/i.test(command)
+  return /(?:^|\s)(?:--help|--version)(?:=|\s|$)|(?:^|\s)-(?:h|v)(?:\s|$)/i.test(command)
 }
 
 type DependencyMutation = 'immutable' | 'mutable'
@@ -694,6 +734,7 @@ function exportedConfigObject(source: string): { body: string, start: number } |
 
 function activeHeadersBody(configBody: string): string | null {
   const projection = topLevelProjection(configBody)
+  const properties = [...projection.matchAll(/(?:^|[,;])\s*headers\b/gm)]
   const patterns = [
     /(?:^|[,;])\s*(?:async\s+)?headers\s*\([^)]*\)\s*\{/gm,
     /(?:^|[,;])\s*headers\s*:\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*(?:=>\s*)?\{/gm,
@@ -701,7 +742,8 @@ function activeHeadersBody(configBody: string): string | null {
   const matches = patterns.flatMap((pattern) => [...projection.matchAll(pattern)])
     .sort((left, right) => (left.index ?? 0) - (right.index ?? 0))
   const effective = matches.at(-1)
-  if (!effective) return null
+  const effectiveProperty = properties.at(-1)
+  if (!effective || !effectiveProperty || effective.index !== effectiveProperty.index) return null
   const openingBrace = projection.indexOf('{', effective.index)
   return extractDelimitedBody(configBody, openingBrace, '{', '}')
 }
@@ -885,7 +927,7 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Expose the standard health route and configure the deployment platform to probe it with bounded timeouts.',
     check: (context) => {
       const route = dependencies(context).has('@open-mercato/core') || context.exists('src/app/api/healthz/route.ts')
-      const configured = /\/api\/healthz/.test(context.collectDeploymentText())
+      const configured = configuredHealthCheck(context)
       if (route && configured) return { status: 'warning', summary: 'The health route is wired; verify bounded dependency-failure and recovery behavior in the deployed environment.' }
       const evidence = [!route ? 'Missing src/app/api/healthz/route.ts.' : '', !configured ? 'Deployment configuration does not reference /api/healthz.' : ''].filter(Boolean)
       return { status: 'fail', summary: 'Health-check wiring is incomplete.', evidence }
@@ -955,7 +997,7 @@ export const RULES: readonly RuleDefinition[] = [
   rule({
     id: 'release-database-migrations', title: 'Database migrations are part of release startup', category: 'Release', severity: 'high',
     remediation: 'Run the supported database migration command once per release before accepting traffic.',
-    check: (context) => /(?:db[: ]migrate|mercato\s+db\s+migrate)/i.test(executableDeploymentText(context))
+    check: (context) => configuredMigration(context)
       ? { status: 'warning', summary: 'A migration path exists; verify exactly one controlled release job can execute it.' }
       : { status: 'fail', summary: 'No database migration step was found in deployment configuration.' },
   }),

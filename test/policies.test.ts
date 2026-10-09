@@ -253,6 +253,9 @@ test('counts only active blocking workflow commands as release validation', () =
       ['  workflow_dispatch:'],
       ['  workflow_call:'],
       ['  push:', '    branches: [feature-only]'],
+      ['  push:', '    branches: [feature/**]'],
+      ['  push:', '    branches-ignore: [main, master, develop]'],
+      ['  push:', '    branches-ignore: [ma*]'],
     ]) {
       overwrite(root, '.github/workflows/release.yml', [
         'on:',
@@ -363,6 +366,8 @@ test('requires effective worker and command evidence instead of comments or empt
     for (const scripts of [
       { build: 'NODE_ENV=production next build --help', start: 'next start' },
       { build: 'NODE_ENV=production next build', start: 'next start --help' },
+      { build: 'NODE_ENV=production next build --help=true', start: 'next start' },
+      { build: 'NODE_ENV=production next build', start: 'next start --version=true' },
     ]) {
       manifest.scripts = scripts
       fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify(manifest))
@@ -370,12 +375,16 @@ test('requires effective worker and command evidence instead of comments or empt
     }
 
     const baselineIgnore = fs.readFileSync(path.join(root, '.gitignore'), 'utf8')
-    overwrite(root, '.gitignore', `${baselineIgnore}\n!.env.production\n!*.pem\n`)
+    overwrite(root, '.gitignore', `${baselineIgnore}\n!.env.production\n!*.pem\n!.env.[p]roduction\n`)
     assert.equal(status(root, 'secrets-ignore-policy'), 'fail')
     overwrite(root, '.gitignore', baselineIgnore)
 
     const baselineTemplate = fs.readFileSync(path.join(root, '.env.example'), 'utf8')
     overwrite(root, '.env.example', baselineTemplate.replace('DATABASE_URL=', 'DATABASE_URL=postgres://operator:live-password@database.internal/app'))
+    assert.equal(status(root, 'runtime-env-template'), 'fail')
+    overwrite(root, '.env.example', baselineTemplate.replace('DATABASE_URL=', 'DATABASE_URL=postgres://example.com/app?password=live-secret'))
+    assert.equal(status(root, 'runtime-env-template'), 'fail')
+    overwrite(root, '.env.example', baselineTemplate.replace('DATABASE_URL=', 'DATABASE_URL="postgres://example.com/app#token=percent%2Dencoded%2Dsecret"'))
     assert.equal(status(root, 'runtime-env-template'), 'fail')
     overwrite(root, '.env.example', baselineTemplate)
 
@@ -394,6 +403,16 @@ test('requires effective worker and command evidence instead of comments or empt
       overwrite(root, 'railway.worker.toml', `[deploy]\nstartCommand = "${command}"\n`)
       assert.equal(status(root, 'operations-worker-topology'), 'fail', command)
     }
+    overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "npm run worker"\n')
+    assert.equal(status(root, 'operations-worker-topology'), 'fail')
+    const workerManifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8')) as { scripts: Record<string, string> }
+    workerManifest.scripts.worker = 'mercato worker'
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify(workerManifest))
+    assert.equal(status(root, 'operations-worker-topology'), 'pass')
+
+    overwrite(root, 'railway.toml', '[deploy]\nstartCommand = "echo /api/healthz && echo yarn db:migrate"\n')
+    assert.equal(status(root, 'operations-health-check'), 'fail')
+    assert.equal(status(root, 'release-database-migrations'), 'fail')
 
     overwrite(root, 'railway.worker.toml', '[deploy]\nstartCommand = "yarn mercato worker"\n')
     overwrite(root, 'docker-compose.fullapp.yml', [
@@ -429,6 +448,12 @@ test('requires effective worker and command evidence instead of comments or empt
     overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, async headers() { return [] } }\n`)
     assert.equal(status(root, 'edge-security-headers'), 'fail')
     overwrite(root, 'next.config.ts', `let config = { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] } }; config = { async headers() { return [] } }; export default config\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, headers: undefined }\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, headers: async () => [] }\n`)
+    assert.equal(status(root, 'edge-security-headers'), 'fail')
+    overwrite(root, 'next.config.ts', `const headers = undefined; export default { async headers() { return [{ source: "/:path*", headers: ${validHeaders} }] }, headers }\n`)
     assert.equal(status(root, 'edge-security-headers'), 'fail')
 
     overwrite(root, 'Dockerfile', 'FROM node:24\nRUN npm ci; npm install\nUSER app\n')
