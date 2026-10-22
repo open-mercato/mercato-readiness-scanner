@@ -68,7 +68,7 @@ export function createScanContext(root: string, options: { checkSecrets?: boolea
   return {
     root,
     packageJson,
-    inspectCredentials: () => inspection ??= inspectLocalCredentials(root, options.checkSecrets === true, options.credentialEnvironment),
+    inspectCredentials: () => inspection ??= inspectLocalCredentials(root, options.checkSecrets !== false, options.credentialEnvironment),
     trackedFiles: gitTrackedFiles(root),
     exists: (relativePath) => existsInside(root, relativePath),
     readText: (relativePath) => readSafeText(root, relativePath),

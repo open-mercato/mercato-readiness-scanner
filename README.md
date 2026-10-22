@@ -64,13 +64,13 @@ remediation text and a permanent rule-documentation URL.
 
 ## Check credentials and encryption keys
 
-Enable local credential inspection explicitly:
+Credential inspection runs automatically in every scan:
 
 ```bash
-npx mercato-readiness-scanner@0.2.0 scan . --check-secrets --fail-on high
+npx mercato-readiness-scanner@0.2.1 scan . --fail-on high
 ```
 
-`--check-secrets` inspects root `.env`, `.env.production`, `.env.local`, and
+`scan` inspects root `.env`, `.env.production`, `.env.local`, and
 `.env.production.local` files, visible runtime settings, and supported Compose
 service environments. It checks every detected credential-like setting, including
 JWT/signing secrets, database and Redis passwords, other service passwords,
@@ -103,9 +103,10 @@ in a plaintext `.env` file.** Keep durable recovery copies and plan key rotation
 replacing an existing encryption key can make stored data unreadable. A hosting
 secret mechanism delivers values; KMS also manages encryption-key operations.
 
-Default scans keep live credential values unread and mark the two strength
-checks as skipped. KMS and secret-delivery review warnings appear in every scan.
-Even with Vault settings present, live KMS access and recovery need verification.
+Since **0.2.1**, credential-strength and encryption-key checks run by default.
+The old `--check-secrets` flag remains accepted for compatibility. KMS and
+secret-delivery review warnings appear in every scan. Even with Vault settings
+present, live KMS access and recovery need verification.
 
 ## Save a report
 
@@ -134,7 +135,7 @@ Pin the scanner version and fail the job on high or critical findings while
 saving a JSON report:
 
 ```bash
-npx --yes mercato-readiness-scanner@0.2.0 scan . --json readiness.json --fail-on high
+npx --yes mercato-readiness-scanner@0.2.1 scan . --json readiness.json --fail-on high
 ```
 
 `--fail-on` accepts `critical`, `high`, `medium`, `low`, or `never` (the default).
@@ -151,6 +152,31 @@ verification. Reports are rendered or saved before the exit threshold is applied
 ## Apply the remediations
 
 `mercato-readiness apply` is the one opt-in exception to the read-only rule. It has two modes.
+
+### Test the fixes
+
+Start in a clean Git working tree, then preview the changes:
+
+```bash
+npx mercato-readiness-scanner@0.2.1 apply . --dry-run
+```
+
+Apply the safe changes, review the tracked diff and any newly created files,
+then scan again:
+
+```bash
+npx mercato-readiness-scanner@0.2.1 apply . --yes
+git status --short
+git diff
+npx mercato-readiness-scanner@0.2.1 scan . --fail-on high
+```
+
+`apply` can add missing ignore patterns, build/start scripts, and runbook stubs.
+Credential rotation, encryption keys, KMS provisioning, and existing deployment
+configuration require manual changes. The final scan can therefore still report
+failures after all safe fixes have been applied. Runbook stubs require operator
+verification. To test idempotence after reviewing the changes, a second
+`apply . --yes --allow-dirty` should report `0 change(s) written`.
 
 ### Hard preconditions
 
@@ -249,8 +275,8 @@ target guard runs before readiness checks or report output, regardless of
 `--fail-on` or report format. Generated applications in unrelated workspaces
 remain supported.
 
-Default scans never open live `.env*` files. Explicit `scan --check-secrets`
-adds bounded, in-memory credential inspection as described above. Git is queried
+Scans inspect supported production `.env` files and runtime credentials in
+memory by default, as described above. `apply` does not read live credentials. Git is queried
 only for tracked path names to identify committed environment files. Repository hooks, filesystem monitors, and optional Git locks are
 disabled for that read-only query. Only the explicitly sanitized `.env.example`, `.env.sample`, and
 `.env.template` forms are eligible for the default template configuration checks. Evidence omits

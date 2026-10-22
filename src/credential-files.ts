@@ -39,16 +39,16 @@ function combine(checks: RuleCheck[], fallback: string): RuleCheck {
   return { status: primary?.status ?? 'warning', summary: primary?.summary ?? fallback, evidence: [...new Set(checks.flatMap((check) => check.evidence ?? []))].sort() }
 }
 
-/** The only live dotenv reader. Callers must explicitly enable this with --check-secrets. */
-export function inspectLocalCredentials(root: string, enabled = false, environment: Readonly<Record<string, string | undefined>> = process.env): CredentialInspection {
+/** The bounded live dotenv reader. Enabled for scan; apply explicitly disables it. */
+export function inspectLocalCredentials(root: string, enabled = true, environment: Readonly<Record<string, string | undefined>> = process.env): CredentialInspection {
   const present = PRODUCTION_ENV_FILES.filter((file) => { try { fs.lstatSync(path.join(root, file)); return true } catch { return false } })
   const delivery: RuleCheck = {
     status: 'warning', summary: present.length ? 'Local production environment files exist. Keep them out of deployed artifacts and inject production credentials through a secret mechanism.' : 'Verify that production credentials are injected through the hosting platform secret mechanism.',
     evidence: present.map((file) => `Local environment path: ${file}`),
   }
   if (!enabled) return {
-    credentials: { status: 'skipped', summary: 'Live credential strength was not inspected. Run scan --check-secrets to inspect local production settings in memory.' },
-    encryption: { status: 'skipped', summary: 'Live encryption key strength was not inspected. Run scan --check-secrets to inspect local production settings in memory.' },
+    credentials: { status: 'skipped', summary: 'Live credential strength was not inspected. Run scan to inspect local production settings in memory.' },
+    encryption: { status: 'skipped', summary: 'Live encryption key strength was not inspected. Run scan to inspect local production settings in memory.' },
     kms: { status: 'warning', summary: `KMS configuration is unverified because live credential inspection is disabled. ${SECRET_DELIVERY_GUIDANCE}` }, delivery,
   }
   const templates: Record<string, string[]> = Object.create(null)

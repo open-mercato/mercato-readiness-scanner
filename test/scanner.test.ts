@@ -80,7 +80,7 @@ test('scans a generated application and returns one result per documented rule',
   }
 })
 
-test('never reads a tracked live environment file or exposes its value', () => {
+test('reports tracked environment paths and inspects supported settings without exposing values', () => {
   const root = makeAppFixture()
   const secret = 'SHOULD_NOT_APPEAR_7d51f9'
   try {

@@ -3,8 +3,8 @@
 **Rule ID:** `secrets-credential-strength`
 **Severity:** Critical
 
-Enable this check with `scan --check-secrets`. Default scans skip live-value
-inspection. The check examines credential-like names in root `.env`,
+This check runs by default in every scan starting with version 0.2.1.
+The old `--check-secrets` flag remains accepted for compatibility. The check examines credential-like names in root `.env`,
 `.env.production`, `.env.local`, `.env.production.local`, the scanner's visible
 runtime environment, and supported Compose service environments. It also inspects
 Redis `--requirepass` settings. Application code, shell commands, and dotenv

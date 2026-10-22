@@ -4,7 +4,8 @@
 **Severity:** High
 
 This rule always requires operator verification. It reports known local
-production dotenv paths without opening them during a default scan. A local
+production dotenv paths. Scans inspect supported credential values in memory
+by default; the delivery check itself relies only on path presence. A local
 `.env` file is not proof that production ships secrets, and absence of one is
 not proof of secure deployment.
 

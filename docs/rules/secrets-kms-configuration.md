@@ -5,7 +5,7 @@
 
 This rule produces a warning when no complete Open Mercato Vault KMS
 configuration can be identified, and when live credential inspection is disabled.
-With `--check-secrets`, `VAULT_ADDR` must be an HTTP(S) URL and `VAULT_TOKEN` must
+During a scan, `VAULT_ADDR` must be an HTTP(S) URL and `VAULT_TOKEN` must
 be nonempty and not an obvious placeholder or unresolved reference to recognize
 configured Vault settings. Settings in Compose are considered per service;
 dotenv layers and the visible runtime environment are considered together.

@@ -3,7 +3,8 @@
 **Rule ID:** `secrets-encryption-key-strength`
 **Severity:** Critical
 
-Enable live-value inspection with `scan --check-secrets`. This check covers
+Live-value inspection runs by default during scan starting with version 0.2.1.
+This check covers
 `TENANT_DATA_ENCRYPTION_FALLBACK_KEY`, `TENANT_DATA_ENCRYPTION_KEY`,
 `KMS_MASTER_KEY`, `FORMS_ENCRYPTION_MASTER_KEY`, `LOOKUP_HASH_PEPPER`, and detected
 encryption-key settings in the supported local production sources.

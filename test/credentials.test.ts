@@ -83,7 +83,7 @@ test('inspects opaque JWT headers without claiming signature verification', () =
   assert.equal(assessCredentials({ CUSTOM_API_TOKEN: `${header('HS256')}.e30.c2lnbmF0dXJl` }).credentials.status, 'warning')
 })
 
-test('default scan does not open live files; opt-in still flags weak files with safe runtime overrides', () => {
+test('disabled inspection never opens live files; enabled checks flag weak files with safe runtime overrides', () => {
   const root = makeAppFixture()
   try {
     fs.writeFileSync(path.join(root, '.env.production'), 'JWT_SECRET=change-me-dev-auth-secret\nTENANT_DATA_ENCRYPTION_FALLBACK_KEY=om-dev-tenant-encryption\n')
@@ -145,7 +145,7 @@ test('all report formats omit credential values, parser errors, and absolute pat
   } finally { removeFixture(root) }
 })
 
-test('CLI opt-in checks produce severity exit codes using only synthetic environment settings', () => {
+test('CLI checks credentials by default and accepts the old flag using only synthetic environment settings', () => {
   const root = makeAppFixture()
   try {
     fs.writeFileSync(path.join(root, '.env.production'), 'JWT_SECRET=changeme\nTENANT_DATA_ENCRYPTION_FALLBACK_KEY=om-dev-tenant-encryption\n')
@@ -156,9 +156,9 @@ test('CLI opt-in checks produce severity exit codes using only synthetic environ
     assert.equal(checked.stderr, '')
     assert.equal(JSON.parse(checked.stdout).results.find((rule: { id: string }) => rule.id === 'secrets-encryption-key-strength').status, 'fail')
     assert.equal(checked.stdout.includes('om-dev-tenant-encryption'), false)
-    const ordinary = run(['scan', root, '--format', 'json'])
-    assert.equal(ordinary.status, 0, ordinary.stderr)
-    assert.equal(JSON.parse(ordinary.stdout).results.find((rule: { id: string }) => rule.id === 'secrets-credential-strength').status, 'skipped')
+    const ordinary = run(['scan', root, '--format', 'json', '--fail-on', 'critical'])
+    assert.equal(ordinary.status, 1, ordinary.stderr)
+    assert.equal(JSON.parse(ordinary.stdout).results.find((rule: { id: string }) => rule.id === 'secrets-credential-strength').status, 'fail')
     const apply = run(['apply', root, '--check-secrets', '--yes'])
     assert.equal(apply.status, 2)
     assert.match(apply.stderr, /apply never reads live credentials/)
@@ -174,5 +174,17 @@ test('Compose credentials inherited from the runtime environment are assessed an
     const missing = inspectLocalCredentials(root, true, {})
     assert.equal(missing.credentials.status, 'warning')
     assert.match(missing.credentials.evidence?.join('\n') ?? '', /inherited/)
+  } finally { removeFixture(root) }
+})
+
+
+test('programmatic scan contexts inspect credentials by default and permit apply to disable inspection', () => {
+  const root = makeAppFixture()
+  try {
+    fs.writeFileSync(path.join(root, '.env.production'), 'JWT_SECRET=changeme\n')
+    const enabled = createScanContext(root, { credentialEnvironment: {} })
+    assert.equal(enabled.inspectCredentials().credentials.status, 'fail')
+    const disabled = createScanContext(root, { checkSecrets: false, credentialEnvironment: {} })
+    assert.equal(disabled.inspectCredentials().credentials.status, 'skipped')
   } finally { removeFixture(root) }
 })

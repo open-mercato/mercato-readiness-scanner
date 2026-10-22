@@ -1,6 +1,6 @@
 {
   "name": "mercato-readiness-scanner",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Static production-readiness scanner for Open Mercato applications.",
   "type": "module",
   "bin": {
@@ -18,8 +18,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/finalize-build.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --import tsx --test test/*.test.ts",
-    "test:built": "node --test test-built/*.test.mjs",
+    "test": "node scripts/run-tests.mjs",
+    "test:built": "node scripts/run-tests.mjs built",
     "pack:check": "node scripts/check-package.mjs",
     "registry:check": "node scripts/check-registry.mjs",
     "check": "npm run typecheck && npm test && npm run build && npm run test:built && npm run pack:check && npm run registry:check",

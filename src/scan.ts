@@ -3,7 +3,7 @@ import { createScanContext, findScanTarget } from './app.js'
 import { RULES } from './rules.js'
 import type { ScanContext, ScanReport, ScanSummary } from './types.js'
 
-export const VERSION = '0.2.0'
+export const VERSION = '0.2.1'
 
 export type ScanOptions = { checkSecrets?: boolean }
 
