@@ -1,5 +1,5 @@
 import path from 'node:path'
-import { createScanContext, findAppRoot } from './app.js'
+import { createScanContext, findScanTarget } from './app.js'
 import { RULES } from './rules.js'
 import type { ScanContext, ScanReport, ScanSummary } from './types.js'
 
@@ -20,8 +20,12 @@ export type ResolvedTarget = {
 
 /** Locates the application and builds its read-only scan context, or throws InvalidTargetError. */
 export function resolveTarget(start: string): ResolvedTarget {
-  const root = findAppRoot(start)
-  if (!root) throw new InvalidTargetError('No create-mercato-app application was found here or in a parent directory.')
+  const target = findScanTarget(start)
+  if (!target) throw new InvalidTargetError('No create-mercato-app application was found here or in a parent directory.')
+  if (target.kind === 'monorepo') {
+    throw new InvalidTargetError('[runtime-standalone-application] The Open Mercato monorepo is not a valid way to start a production app. Create a standalone application with create-mercato-app and run the readiness scanner there.')
+  }
+  const { root } = target
   return { root, context: createScanContext(root) }
 }
 

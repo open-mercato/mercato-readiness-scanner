@@ -1,14 +1,13 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { collectCiText, collectCiWorkflows, collectDeploymentText, existsInside, gitTrackedFiles, readSafeText } from './files.js'
+import { collectCiText, collectCiWorkflows, collectDeploymentText, collectOperationalDocs, existsInside, gitTrackedFiles, readSafeText } from './files.js'
 import type { ScanContext } from './types.js'
 
-function readPackageJson(directory: string): Record<string, unknown> | null {
-  const file = path.join(directory, 'package.json')
+function readPackageJson(directory: string, relativePath = 'package.json'): Record<string, unknown> | null {
   try {
-    const stat = fs.lstatSync(file)
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1_048_576) return null
-    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'))
+    const source = readSafeText(directory, relativePath)
+    if (source === null) return null
+    const parsed: unknown = JSON.parse(source)
     return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
       ? parsed as Record<string, unknown>
       : null
@@ -26,7 +25,19 @@ function hasOpenMercatoCore(manifest: Record<string, unknown>): boolean {
   return false
 }
 
-export function findAppRoot(start: string): string | null {
+function isOpenMercatoMonorepo(root: string, manifest: Record<string, unknown>): boolean {
+  const workspaces = manifest.workspaces
+  const packages = Array.isArray(workspaces) ? workspaces
+    : workspaces && typeof workspaces === 'object' ? (workspaces as Record<string, unknown>).packages : null
+  if (!Array.isArray(packages) || !packages.some((entry) => typeof entry === 'string')) return false
+  if (readPackageJson(root, 'packages/core/package.json')?.name !== '@open-mercato/core') return false
+  return manifest.name === 'open-mercato'
+    || readPackageJson(root, 'packages/create-app/package.json')?.name === 'create-mercato-app'
+}
+
+type ScanTarget = { root: string, kind: 'app' | 'monorepo' }
+
+export function findScanTarget(start: string): ScanTarget | null {
   let current: string
   try {
     current = fs.realpathSync(path.resolve(start))
@@ -34,11 +45,16 @@ export function findAppRoot(start: string): string | null {
   } catch {
     return null
   }
+  let app: ScanTarget | null = null
   while (true) {
     const manifest = readPackageJson(current)
-    if (manifest && hasOpenMercatoCore(manifest) && existsInside(current, 'src/modules.ts')) return current
+    // Inspect all ancestors: the monorepo's internal app also looks like a generated app.
+    if (manifest && isOpenMercatoMonorepo(current, manifest)) return { root: current, kind: 'monorepo' }
+    if (!app && manifest && hasOpenMercatoCore(manifest) && existsInside(current, 'src/modules.ts')) {
+      app = { root: current, kind: 'app' }
+    }
     const parent = path.dirname(current)
-    if (parent === current) return null
+    if (parent === current) return app
     current = parent
   }
 }
@@ -53,6 +69,7 @@ export function createScanContext(root: string): ScanContext {
     exists: (relativePath) => existsInside(root, relativePath),
     readText: (relativePath) => readSafeText(root, relativePath),
     collectDeploymentText: () => collectDeploymentText(root),
+    collectOperationalDocs: () => collectOperationalDocs(root),
     collectCiText: () => collectCiText(root),
     collectCiWorkflows: () => collectCiWorkflows(root),
   }

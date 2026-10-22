@@ -76,7 +76,7 @@ type WriteResult = { changed: boolean, note: string | null }
  */
 function resolveWritable(root: string, relativePath: string): string {
   if (path.isAbsolute(relativePath)) throw new ApplyRefusedError(`Refusing to write an absolute path: ${relativePath}`)
-  if (isLiveEnvPath(relativePath) || isCredentialPath(relativePath)) throw new ApplyRefusedError(`Refusing to write the secret-bearing path ${relativePath}.`)
+  if (path.basename(relativePath).toLowerCase().startsWith('.env') || isLiveEnvPath(relativePath) || isCredentialPath(relativePath)) throw new ApplyRefusedError(`Refusing to write the secret-bearing path ${relativePath}.`)
   const absolute = path.resolve(root, relativePath)
   const relation = path.relative(root, absolute)
   if (!relation || relation === '..' || relation.startsWith(`..${path.sep}`) || path.isAbsolute(relation)) {
@@ -167,7 +167,7 @@ function addNpmScript(root: string, name: string, value: string): WriteResult {
   manifest.scripts = { ...existing, [name]: value }
   const updated = `${JSON.stringify(manifest, null, indent)}${trailing}`
   const temporary = `${absolute}.tmp-${process.pid}`
-  fs.writeFileSync(temporary, updated, { encoding: 'utf8', mode: fs.statSync(absolute).mode & 0o777 })
+  fs.writeFileSync(temporary, updated, { encoding: 'utf8', flag: 'wx', mode: fs.statSync(absolute).mode & 0o777 })
   fs.renameSync(temporary, absolute)
   return { changed: true, note: null }
 }

@@ -25,7 +25,7 @@ function manual(reason: string): AutofixDescriptor {
   return { safety: 'manual-only', reason }
 }
 
-export const REQUIRED_IGNORE_PATTERNS = ['.env', '.env.production', '.env.local', '.env.*.local', '*.pem', '*.key', '.mcp.json', '.npmrc', '.ai/session-exports/'] as const
+export const REQUIRED_IGNORE_PATTERNS = ['.env', '.env*', '!.env.example', '!.env.sample', '!.env.template', '.env.production', '.env.staging', '.envrc', '.env.local', '.env.*.local', '*.pem', '*.key', '.mcp.json', '.npmrc', '.ai/session-exports/'] as const
 
 const IGNORE_FILE_HEADER = ['# Sensitive local artifacts (added by mercato-readiness apply).', '# Review and extend this policy for the artifacts your team keeps locally.'] as const
 
@@ -97,6 +97,7 @@ function dependencies(context: ScanContext): ReadonlySet<string> {
 
 type TemplateInventory = {
   names: ReadonlySet<string>
+  values: ReadonlyMap<string, string>
   booleans: ReadonlyMap<string, boolean>
   integers: ReadonlyMap<string, number>
   enums: ReadonlyMap<string, string>
@@ -105,6 +106,7 @@ type TemplateInventory = {
 function templateInventory(context: ScanContext): TemplateInventory {
   const source = context.readText('.env.example') ?? ''
   const names = new Set<string>()
+  const templateValues = new Map<string, string>()
   const booleans = new Map<string, boolean>()
   const integers = new Map<string, number>()
   const enums = new Map<string, string>()
@@ -118,6 +120,7 @@ function templateInventory(context: ScanContext): TemplateInventory {
     if (!/^[A-Z][A-Z0-9_]*$/.test(key) || rawValue === undefined) continue
     names.add(key)
     const normalizedValue = rawValue.trim()
+    templateValues.set(key, normalizedValue)
     if (/(?:DEBUG|PROFILE|DEVTOOLS|AUTOLOGIN|TEST_INJECT|DEMO_MODE|EMERGENCY_BYPASS|INTEGRATION_TEST|AUTO_SPAWN_WORKERS)/.test(key)) {
       if (/^(?:1|true|yes|y|on|enabled)$/i.test(normalizedValue)) booleans.set(key, true)
       if (/^(?:0|false|no|n|off|disabled)$/i.test(normalizedValue)) booleans.set(key, false)
@@ -125,7 +128,7 @@ function templateInventory(context: ScanContext): TemplateInventory {
     if (key === 'RATE_LIMIT_TRUST_PROXY_DEPTH' && /^-?\d+$/.test(normalizedValue)) integers.set(key, Number(normalizedValue))
     if (key === 'CACHE_STRATEGY' && /^(?:redis|memory|sqlite)$/i.test(normalizedValue)) enums.set(key, normalizedValue.toLowerCase())
   }
-  return { names, booleans, integers, enums }
+  return { names, values: templateValues, booleans, integers, enums }
 }
 
 function containsAll(source: string, values: string[]): boolean {
@@ -143,9 +146,19 @@ function displayPath(value: string): string {
 function missingSensitiveIgnoreCoverage(context: ScanContext): string[] {
   const source = context.readText('.gitignore') ?? ''
   if (!source.trim()) return ['all sensitive local artifacts']
+  const safeExceptions = new Set(['.env.example', '.env.sample', '.env.template'])
+  const unsafeExceptions = source.split(/\r?\n/).map((line) => line.trim()).filter((line) => {
+    if (!line.startsWith('!')) return false
+    const pattern = line.slice(1).replace(/^\//, '').toLowerCase()
+    if (safeExceptions.has(pattern)) return false
+    return pattern.includes('.env') || /(?:pem|\.key|npmrc|mcp\.json|session-exports)/.test(pattern)
+  })
+  if (unsafeExceptions.some((line) => /[?*\[]/.test(line))) return ['sensitive-path re-inclusion']
   const probes = [
     ['.env', '.env'],
     ['.env.production', '.env.production'],
+    ['.env.staging', '.env.staging'],
+    ['.envrc', '.envrc'],
     ['.env.local', '.env.local'],
     ['.env.*.local', '.env.preview.local'],
     ['*.pem', 'operator.pem'],
@@ -154,9 +167,13 @@ function missingSensitiveIgnoreCoverage(context: ScanContext): string[] {
     ['.npmrc', '.npmrc'],
     ['.ai/session-exports/', '.ai/session-exports/session.json'],
   ] as const
-  const ignored = gitignoredPaths(source, probes.map(([, path]) => path))
+  const candidates: Array<readonly [string, string]> = [...probes, ...unsafeExceptions.map((line) => {
+    const candidate = line.slice(1).replace(/^\//, '')
+    return [candidate, candidate] as const
+  })]
+  const ignored = gitignoredPaths(source, candidates.map(([, path]) => path))
   if (!ignored) return probes.map(([pattern]) => pattern)
-  return probes.filter(([, path]) => !ignored.has(path)).map(([pattern]) => pattern)
+  return candidates.filter(([, path]) => !ignored.has(path)).map(([pattern]) => pattern)
 }
 
 function unsafeTemplateValues(context: ScanContext): string[] {
@@ -167,20 +184,23 @@ function unsafeTemplateValues(context: ScanContext): string[] {
   } catch {
     return ['unparseable template']
   }
-  const sensitiveName = /(?:^|_)(?:DATABASE_URL|REDIS_URL|PASSWORD|PASS|TOKEN|SECRET|PRIVATE_KEY|API_KEY|CREDENTIALS?)(?:$|_)/i
+  const sensitiveName = (name: string): boolean => /(?:databaseurl|redisurl|password|passwd|pwd|token|secret|privatekey|apikey|credentials?|sslpassword)/i
+    .test(name.replace(/[^A-Za-z0-9]/g, ''))
   const placeholder = /^(?:|changeme|replace[-_ ]?me|dummy|placeholder|example|<[^>]+>|\$\{[^}]+\})$/i
   const safeHost = (host: string): boolean => host === 'localhost' || host === '127.0.0.1' || host === '::1'
     || host === 'example.com' || host.endsWith('.example') || host.endsWith('.test')
   const unsafe: string[] = []
   for (const [key, raw] of Object.entries(values)) {
-    if (!sensitiveName.test(key) || raw === undefined) continue
+    if (!sensitiveName(key) || raw === undefined) continue
     const value = raw.trim()
     if (placeholder.test(value)) continue
     try {
       const url = new URL(value)
-      const sensitiveParameter = [...url.searchParams.entries()].some(([name, parameter]) => sensitiveName.test(name) && !placeholder.test(parameter))
+      const sensitiveParameter = [...url.searchParams.entries()].some(([name, parameter]) => sensitiveName(name) && !placeholder.test(parameter))
       const fragmentParameters = new URLSearchParams(url.hash.replace(/^#/, ''))
-      const sensitiveFragment = [...fragmentParameters.entries()].some(([name, parameter]) => sensitiveName.test(name) && !placeholder.test(parameter))
+      const fragment = decodeURIComponent(url.hash.replace(/^#/, '')).trim()
+      const sensitiveFragment = [...fragmentParameters.entries()].some(([name, parameter]) => sensitiveName(name) && !placeholder.test(parameter))
+        || (fragment.length > 0 && !placeholder.test(fragment) && !fragment.includes('='))
       if (sensitiveParameter || sensitiveFragment) {
         unsafe.push(key)
         continue
@@ -314,22 +334,46 @@ function uncommented(source: string): string {
 const DEPLOYMENT_FILES = ['Dockerfile', 'railway.toml', 'railway.worker.toml', 'scripts/railway-start.sh', 'scripts/railway-worker.sh', 'docker/scripts/init-or-migrate.sh'] as const
 const COMPOSE_FILES = ['docker-compose.yml', 'docker-compose.fullapp.yml'] as const
 
-function tomlString(source: string, field: string): string | null {
-  const match = new RegExp(`^\\s*${field}\\s*=\\s*["']([^"']+)["']\\s*$`, 'mi').exec(uncommented(source))
-  return match?.[1] ?? null
+function tomlSectionString(source: string, section: string, field: string): string | null {
+  let activeSection = ''
+  let value: string | null = null
+  for (const line of uncommented(source).split(/\r?\n/)) {
+    const sectionMatch = line.match(/^\s*\[([^\]]+)]\s*$/)
+    if (sectionMatch?.[1]) {
+      activeSection = sectionMatch[1].trim()
+      continue
+    }
+    if (activeSection !== section) continue
+    const fieldMatch = line.match(new RegExp(`^\\s*${field}\\s*=\\s*["']([^"']+)["']\\s*$`, 'i'))
+    if (fieldMatch?.[1]) value = fieldMatch[1]
+  }
+  return value
+}
+
+function executableHealthCheck(value: Record<string, unknown>): boolean {
+  if (value.disable === true || constantBoolean(value.disable, true)) return false
+  const test = value.test
+  const parts = Array.isArray(test) ? test.filter((entry): entry is string => typeof entry === 'string') : [String(test ?? '')]
+  if (!parts.length) return false
+  const command = parts.filter((entry, index) => index > 0 || !/^(?:CMD|CMD-SHELL)$/i.test(entry.trim())).join(' ').trim()
+  if (!command || !commandPreservesFailure(command) || hasNonExecutingFlag(command)) return false
+  const executable = command.replace(/^(?:sh|bash)\s+(?:-[A-Za-z]*e[A-Za-z]*\s+)?-c\s+/i, '')
+  if (/^wget\b[^\r\n;&|]*\/api\/healthz\b/i.test(executable)) return true
+  if (!/^curl\b/i.test(executable)) return false
+  const hasFailureMode = /(?:^|\s)--fail(?:-with-body)?(?=\s|$)/.test(executable)
+    || /(?:^|\s)-[A-Za-z]*f[A-Za-z]*(?=\s|$)/.test(executable)
+  return hasFailureMode && /\/api\/healthz\b/i.test(executable)
 }
 
 function configuredHealthCheck(context: ScanContext): boolean {
   const railway = context.readText('railway.toml')
-  if (railway && tomlString(railway, 'healthcheckPath') === '/api/healthz') return true
+  if (railway && tomlSectionString(railway, 'deploy', 'healthcheckPath') === '/api/healthz') return true
   for (const file of COMPOSE_FILES) {
     const services = composeServices(context, file)
     if (!services) continue
     if (services.some(([, service]) => {
       if (!isRecord(service.healthcheck)) return false
-      const test = service.healthcheck.test
-      const command = Array.isArray(test) ? test.join(' ') : String(test ?? '')
-      return /(?:curl|wget)[^\r\n]*\/api\/healthz\b/i.test(command)
+      return executableHealthCheck(service.healthcheck)
     })) return true
   }
   return false
@@ -338,12 +382,15 @@ function configuredHealthCheck(context: ScanContext): boolean {
 function executableMigrationCommand(command: string): boolean {
   const normalized = uncommented(command).trim()
   if (!normalized || !commandPreservesFailure(normalized) || /<<|;/.test(normalized)) return false
-  return normalized.split(/\s*&&\s*|\r?\n/).some((segment) => /^(?:exec\s+)?(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)(?:\s+[^;&|<\r\n]+)?$/i.test(segment.trim()))
+  const segments = normalized.split(/\s*&&\s*|\r?\n/).map((segment) => segment.trim()).filter(Boolean)
+  const migrationIndex = segments.findIndex((segment) => /^(?:exec\s+)?(?:yarn|pnpm|npm(?:\s+run)?)\s+(?:db:migrate|mercato\s+db\s+migrate)(?:\s+[^;&|<\r\n]+)?$/i.test(segment))
+  if (migrationIndex < 0) return false
+  return segments.slice(0, migrationIndex).every((segment) => /^(?:cd\s+[^;&|<\r\n]+|echo\b[^;&|<\r\n]*|printf\b[^;&|<\r\n]*|set\s+-[A-Za-z]*e[A-Za-z]*|[A-Z_][A-Z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s]+))$/i.test(segment))
 }
 
 function configuredMigration(context: ScanContext): boolean {
   const railway = context.readText('railway.toml')
-  const railwayCommand = railway ? tomlString(railway, 'startCommand') : null
+  const railwayCommand = railway ? tomlSectionString(railway, 'deploy', 'startCommand') : null
   if (railwayCommand && executableMigrationCommand(railwayCommand)) return true
   for (const file of ['scripts/railway-start.sh', 'docker/scripts/init-or-migrate.sh'] as const) {
     const source = context.readText(file)
@@ -564,7 +611,13 @@ function releaseTrigger(value: unknown): boolean {
   if (typeof value === 'string') return value === 'push' || value === 'release'
   if (Array.isArray(value)) return value.some((entry) => entry === 'push' || entry === 'release')
   if (!isRecord(value)) return false
-  if (Object.hasOwn(value, 'release')) return true
+  if (Object.hasOwn(value, 'release')) {
+    const release = value.release
+    if (!isRecord(release) || release.types === undefined) return true
+    const types = (Array.isArray(release.types) ? release.types : [release.types])
+      .filter((entry): entry is string => typeof entry === 'string')
+    if (types.some((type) => ['published', 'released', 'created'].includes(type))) return true
+  }
   if (!Object.hasOwn(value, 'push')) return false
   const push = value.push
   if (!isRecord(push)) return true
@@ -573,15 +626,21 @@ function releaseTrigger(value: unknown): boolean {
   const releaseBranches = new Set(['main', 'master', 'develop'])
   const ignoredBranches = new Set(strings(push['branches-ignore']))
   const branches = strings(push.branches)
+  const tags = strings(push.tags)
   const uncertainBranchIgnore = [...ignoredBranches].some((branch) => /[*?]/.test(branch) || branch.includes('['))
-  const branchPath = branches.length
+  const branchPath = tags.length > 0 && branches.length === 0
+    ? false
+    : branches.length
     ? branches.some((branch) => releaseBranches.has(branch))
     : !uncertainBranchIgnore && [...releaseBranches].some((branch) => !ignoredBranches.has(branch))
-  const tags = strings(push.tags)
   const ignoredTags = strings(push['tags-ignore'])
   const tagPath = tags.some((tag) => /^(?:v|release[-/])(?:\d|\*|\[)/i.test(tag))
     && !ignoredTags.some((tag) => /[*?]/.test(tag) || tag.includes('[') || /^(?:v|release[-/])\d/i.test(tag))
-  return branchPath || tagPath
+  const paths = strings(push.paths)
+  const ignoredPaths = strings(push['paths-ignore'])
+  const pathAllowsRelease = (paths.length === 0 || paths.some((path) => path === '**' || path === '**/*'))
+    && !ignoredPaths.some((path) => path === '*' || path === '**' || path === '**/*')
+  return pathAllowsRelease && (branchPath || tagPath)
 }
 
 function workflowJobs(workflow: string, source: string): WorkflowJob[] {
@@ -596,6 +655,15 @@ function workflowJobs(workflow: string, source: string): WorkflowJob[] {
       const jobRuns = alwaysRuns(value.if)
       const jobBlocking = failureIsBlocking(value['continue-on-error'])
       if (!jobRuns || !jobBlocking) continue
+      const checkoutSteps = value.steps.filter((step) => isRecord(step) && typeof step.uses === 'string' && /^actions\/checkout@/i.test(step.uses))
+      if (checkoutSteps.length === 0) continue
+      const checkoutIsExact = value.steps.every((step) => {
+        if (!isRecord(step) || typeof step.uses !== 'string' || !/^actions\/checkout@/i.test(step.uses)) return true
+        if (!isRecord(step.with) || step.with.ref === undefined) return true
+        if (typeof step.with.ref !== 'string') return false
+        return /^\$\{\{\s*github\.sha\s*\}\}$/i.test(step.with.ref.trim())
+      })
+      if (!checkoutIsExact) continue
       const jobDefaults = isRecord(value.defaults) && isRecord(value.defaults.run) ? value.defaults.run : workflowDefaults
       const commands: WorkflowCommand[] = []
       for (const step of value.steps) {
@@ -632,7 +700,7 @@ function commandPreservesFailure(command: string): boolean {
 }
 
 function hasNonExecutingFlag(command: string): boolean {
-  return /(?:^|\s)(?:--help|--version)(?:=|\s|$)|(?:^|\s)-(?:h|v)(?:\s|$)/i.test(command)
+  return /(?:^|\s)(?:--help|--version)(?:=|\s|$)|(?:^|\s)-(?:h|v)(?:=|\s|$)/i.test(command)
 }
 
 type DependencyMutation = 'immutable' | 'mutable'
@@ -644,14 +712,12 @@ function dependencyMutation(command: string): DependencyMutation | null {
     .replace(/^[A-Za-z][\w.-]*(?:Command|command)\s*=\s*["']?/i, '')
     .replace(/^["']/, '')
     .replace(/^[({]+\s*/, '')
-    .replace(/^(?:exec\s+|sudo\s+|env\s+|corepack\s+)+/i, '')
+    .replace(/^(?:(?:exec|sudo|env|command|corepack)\s+)+/i, '')
     .replace(/^(?:(?:[A-Za-z_][A-Za-z0-9_]*)=(?:"[^"]*"|'[^']*'|[^\s]+)\s+)+/, '')
-    .replace(/^(?:exec\s+|sudo\s+|corepack\s+)+/i, '')
+    .replace(/^(?:(?:exec|sudo|command|corepack)\s+)+/i, '')
     .trim()
   const match = normalized.match(/^(npm|yarn|pnpm)\s+([^\s"']+)([^\n]*)/i)
-  if (!match?.[1] || !match[2]) {
-    return /\b(?:npm|yarn|pnpm)\b[^\n;&|]*\b(?:ci|install|i|add|update|up|upgrade)\b/i.test(normalized) ? 'mutable' : null
-  }
+  if (!match?.[1] || !match[2]) return null
   const manager = match[1].toLowerCase()
   const action = match[2].toLowerCase()
   const args = match[3] ?? ''
@@ -676,15 +742,59 @@ function dependencyInstallationProof(context: ScanContext): { found: boolean, mu
   for (const file of DEPLOYMENT_FILES) {
     const source = uncommented(context.readText(file) ?? '').replace(/\\\r?\n/g, ' ')
     if (!source.trim()) continue
-    const mutations = source
-      .split(/\r?\n|&&|\|\||;|&|\|/)
-      .map(dependencyMutation)
-      .filter((value): value is DependencyMutation => value !== null)
+    if (file === 'Dockerfile') {
+      const state = effectiveDockerDependencyState(source)
+      if (state === null) continue
+      found = true
+      if (state !== 'immutable') mutableSurfaces.push(file)
+      continue
+    }
+    const mutations = source.split(/\r?\n|&&|\|\||;|&|\|/)
+      .map(dependencyMutation).filter((value): value is DependencyMutation => value !== null)
     if (!mutations.length) continue
     found = true
     if (mutations.at(-1) !== 'immutable') mutableSurfaces.push(file)
   }
   return { found, mutableSurfaces }
+}
+
+type DockerDependencyStage = { name: string, parents: string[], mutations: DependencyMutation[] }
+
+function effectiveDockerDependencyState(source: string): DependencyMutation | null {
+  const stages: DockerDependencyStage[] = []
+  let current: DockerDependencyStage | null = null
+  for (const line of source.split(/\r?\n/)) {
+    const from = line.match(/^\s*FROM\s+(?:--platform=\S+\s+)?([^\s]+)(?:\s+AS\s+([^\s#]+))?/i)
+    if (from?.[1]) {
+      current = { name: (from[2] ?? String(stages.length)).toLowerCase(), parents: [from[1].toLowerCase()], mutations: [] }
+      stages.push(current)
+      continue
+    }
+    if (!current) continue
+    const copied = line.match(/^\s*COPY\s+--from=([^\s]+)\b/i)?.[1]?.toLowerCase()
+    if (copied) current.parents.push(copied)
+    for (const command of line.split(/&&|\|\||;|&|\|/)) {
+      const mutation = dependencyMutation(command)
+      if (mutation) current.mutations.push(mutation)
+    }
+  }
+  const finalStage = stages.at(-1)
+  if (!finalStage) return null
+  const byName = new Map(stages.map((stage) => [stage.name, stage]))
+  const resolve = (stage: DockerDependencyStage, visiting = new Set<string>()): DependencyMutation | null => {
+    if (visiting.has(stage.name)) return 'mutable'
+    const nextVisiting = new Set(visiting)
+    nextVisiting.add(stage.name)
+    const inherited = stage.parents.flatMap((parent) => {
+      const dependency = byName.get(parent)
+      return dependency ? [resolve(dependency, nextVisiting)] : []
+    }).filter((value): value is DependencyMutation => value !== null)
+    const own = stage.mutations.at(-1)
+    if (own) return own
+    if (inherited.includes('mutable')) return 'mutable'
+    return inherited.includes('immutable') ? 'immutable' : null
+  }
+  return resolve(finalStage)
 }
 
 function extractDelimitedBody(source: string, openingIndex: number, opening: string, closing: string): string | null {
@@ -754,6 +864,172 @@ function escapedIdentifier(identifier: string): string {
   return identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
+function arrayElements(source: string): string[] | null {
+  const depths = { brace: 0, bracket: 0, parenthesis: 0 }
+  let quote = ''
+  let escaped = false
+  let elementStart = 0
+  const elements: string[] = []
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index] ?? ''
+    if (quote) {
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === quote) quote = ''
+      continue
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character
+      continue
+    }
+    if (character === '{') depths.brace += 1
+    else if (character === '}') depths.brace -= 1
+    else if (character === '[') depths.bracket += 1
+    else if (character === ']') depths.bracket -= 1
+    else if (character === '(') depths.parenthesis += 1
+    else if (character === ')') depths.parenthesis -= 1
+    else if (character === ',' && depths.brace === 0 && depths.bracket === 0 && depths.parenthesis === 0) {
+      elements.push(source.slice(elementStart, index).trim())
+      elementStart = index + 1
+    }
+    if (depths.brace < 0 || depths.bracket < 0 || depths.parenthesis < 0) return null
+  }
+  if (quote || depths.brace !== 0 || depths.bracket !== 0 || depths.parenthesis !== 0) return null
+  const tail = source.slice(elementStart).trim()
+  if (tail || elementStart === 0) elements.push(tail)
+  if (elements.length === 1 && elements[0] === '' && source.trim() === '') return []
+  return elements
+}
+
+function constantStringValue(expression: string): string | null {
+  const quote = expression[0] ?? ''
+  if (!['"', "'", '`'].includes(quote) || expression.at(-1) !== quote) return null
+  const body = expression.slice(1, -1)
+  let value = ''
+  for (let index = 0; index < body.length; index += 1) {
+    const character = body[index] ?? ''
+    if (quote === '`' && character === '$' && body[index + 1] === '{') return null
+    if (character === quote) return null
+    if (character !== '\\') {
+      value += character
+      continue
+    }
+    const escaped = body[index + 1]
+    if (escaped === undefined) return null
+    index += 1
+    if (escaped === '\n' || escaped === '\u2028' || escaped === '\u2029') continue
+    if (escaped === '\r') {
+      if (body[index + 1] === '\n') index += 1
+      continue
+    }
+    if (escaped === 'x') {
+      const digits = body.slice(index + 1, index + 3)
+      if (!/^[0-9a-f]{2}$/i.test(digits)) return null
+      value += String.fromCodePoint(Number.parseInt(digits, 16))
+      index += 2
+      continue
+    }
+    if (escaped === 'u') {
+      if (body[index + 1] === '{') {
+        const closing = body.indexOf('}', index + 2)
+        if (closing < 0) return null
+        const digits = body.slice(index + 2, closing)
+        if (!/^[0-9a-f]{1,6}$/i.test(digits)) return null
+        const codePoint = Number.parseInt(digits, 16)
+        if (codePoint > 0x10ffff) return null
+        value += String.fromCodePoint(codePoint)
+        index = closing
+      } else {
+        const digits = body.slice(index + 1, index + 5)
+        if (!/^[0-9a-f]{4}$/i.test(digits)) return null
+        value += String.fromCodePoint(Number.parseInt(digits, 16))
+        index += 4
+      }
+      continue
+    }
+    const simpleEscapes: Record<string, string> = {
+      b: '\b', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v', 0: '\0',
+    }
+    if (escaped === '0' && /[0-9]/.test(body[index + 1] ?? '')) return null
+    if (/[1-9]/.test(escaped)) return null
+    value += simpleEscapes[escaped] ?? escaped
+  }
+  return value
+}
+
+function constantPropertyKey(expression: string): string | null {
+  let candidate = expression.trim()
+  while (candidate.startsWith('(')) {
+    const body = extractDelimitedBody(candidate, 0, '(', ')')
+    if (body === null || body.length + 2 !== candidate.length) break
+    candidate = body.trim()
+  }
+  const stringValue = constantStringValue(candidate)
+  if (stringValue !== null) return stringValue
+  if (!candidate.startsWith('[')) return null
+  const body = extractDelimitedBody(candidate, 0, '[', ']')
+  if (body === null || body.length + 2 !== candidate.length) return null
+  const elements = arrayElements(body)
+  if (elements === null) return null
+  const values: string[] = []
+  for (const element of elements) {
+    if (!element) {
+      values.push('')
+      continue
+    }
+    const value = constantPropertyKey(element)
+    if (value === null) return null
+    values.push(value)
+  }
+  return values.join(',')
+}
+
+function callArgument(source: string, start: number): string | null {
+  const depths = { brace: 0, bracket: 0, parenthesis: 0 }
+  let quote = ''
+  let escaped = false
+  for (let index = start; index < source.length; index += 1) {
+    const character = source[index] ?? ''
+    if (quote) {
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === quote) quote = ''
+      continue
+    }
+    if (character === '"' || character === "'" || character === '`') {
+      quote = character
+      continue
+    }
+    if (character === '{') depths.brace += 1
+    else if (character === '}') depths.brace -= 1
+    else if (character === '[') depths.bracket += 1
+    else if (character === ']') depths.bracket -= 1
+    else if (character === '(') depths.parenthesis += 1
+    else if (character === ')') {
+      if (depths.parenthesis === 0 && depths.brace === 0 && depths.bracket === 0) return null
+      depths.parenthesis -= 1
+    } else if (character === ',' && depths.brace === 0 && depths.bracket === 0 && depths.parenthesis === 0) {
+      return source.slice(start, index).trim() || null
+    }
+    if (depths.brace < 0 || depths.bracket < 0 || depths.parenthesis < 0) return null
+  }
+  return null
+}
+
+function hasCoercedHeaderMutation(source: string, identifier: string): boolean {
+  const identifierPattern = escapedIdentifier(identifier)
+  const patterns = [
+    new RegExp(`\\b(?:Object|Reflect)\\s*\\.\\s*defineProperty\\s*\\(\\s*${identifierPattern}\\s*,\\s*`, 'gm'),
+    new RegExp(`\\bReflect\\s*\\.\\s*set\\s*\\(\\s*${identifierPattern}\\s*,\\s*`, 'gm'),
+  ]
+  return patterns.some((pattern) => [...source.matchAll(pattern)].some((match) => {
+    const argument = callArgument(source, (match.index ?? 0) + match[0].length)
+    if (argument === null) return true
+    const propertyKey = constantPropertyKey(argument)
+    return propertyKey === null || propertyKey === 'headers'
+  }))
+}
+
 function declaredArray(scope: string, identifier: string): string | null {
   const projection = topLevelProjection(scope)
   const pattern = new RegExp(`(?:(?:const|let|var)\\s+|(?:^|[;\\n])\\s*)${escapedIdentifier(identifier)}\\s*=\\s*`, 'gm')
@@ -789,12 +1065,29 @@ function exportedConfigObject(source: string): { body: string, start: number } |
   const openingBrace = projection.indexOf('{', valueOffset)
   if (openingBrace !== valueOffset || projection.slice(valueOffset, openingBrace).trim()) return null
   const body = extractDelimitedBody(source, openingBrace, '{', '}')
-  return body === null ? null : { body, start: openingBrace }
+  if (body === null) return null
+  const afterObject = source.slice(openingBrace + body.length + 2)
+  const identifierPattern = escapedIdentifier(identifier)
+  const literalHeaderKeyPattern = '(?:["\']headers["\']|`headers`)'
+  const parenthesizedHeaderKeyPattern = `(?:\\(\\s*)*${literalHeaderKeyPattern}(?:\\s*\\))*`
+  const headerKeyPattern = `(?:${literalHeaderKeyPattern}|\\[\\s*${parenthesizedHeaderKeyPattern}\\s*,?\\s*\\]|[A-Za-z_$][\\w$]*)`
+  const mutation = new RegExp([
+    `\\b${identifierPattern}\\s*(?:\\.\\s*headers|\\[\\s*${headerKeyPattern}\\s*])\\s*=`,
+    `\\bdelete\\s+${identifierPattern}\\s*(?:\\.\\s*headers|\\[\\s*${headerKeyPattern}\\s*])`,
+    `\\bObject\\s*\\.\\s*assign\\s*\\(\\s*${identifierPattern}\\s*,\\s*\\{[^)]*(?:\\bheaders\\s*:|\\[\\s*${headerKeyPattern}\\s*])`,
+    `\\b(?:Object|Reflect)\\s*\\.\\s*defineProperty\\s*\\(\\s*${identifierPattern}\\s*,\\s*${headerKeyPattern}`,
+    `\\bObject\\s*\\.\\s*defineProperties\\s*\\(\\s*${identifierPattern}\\s*,\\s*\\{[^)]*(?:\\bheaders\\s*:|\\[\\s*${headerKeyPattern}\\s*])`,
+    `\\bReflect\\s*\\.\\s*set\\s*\\(\\s*${identifierPattern}\\s*,\\s*${headerKeyPattern}`,
+    `\\bObject\\s*\\.\\s*setPrototypeOf\\s*\\(\\s*${identifierPattern}\\b`,
+  ].join('|'), 'm')
+  return mutation.test(afterObject) || hasCoercedHeaderMutation(afterObject, identifier) ? null : { body, start: openingBrace }
 }
 
 function activeHeadersBody(configBody: string): string | null {
   const projection = topLevelProjection(configBody)
-  const properties = [...projection.matchAll(/(?:^|[,;])\s*headers\b/gm)]
+  if (/(?:^|[,;])\s*(?:["']headers["']|\[\s*["']headers["']\s*])\s*:/m.test(configBody)
+    || /(?:^|[,;])\s*get\s+headers\s*\(/m.test(projection)) return null
+  const properties = [...projection.matchAll(/(?:^|[,;])\s*(?:async\s+)?headers\b/gm)]
   const patterns = [
     /(?:^|[,;])\s*(?:async\s+)?headers\s*\([^)]*\)\s*\{/gm,
     /(?:^|[,;])\s*headers\s*:\s*(?:async\s*)?(?:function\s*)?\([^)]*\)\s*(?:=>\s*)?\{/gm,
@@ -804,6 +1097,8 @@ function activeHeadersBody(configBody: string): string | null {
   const effective = matches.at(-1)
   const effectiveProperty = properties.at(-1)
   if (!effective || !effectiveProperty || effective.index !== effectiveProperty.index) return null
+  const trailing = projection.slice((effective.index ?? 0) + effective[0].length)
+  if (/[,;]\s*(?:\.\.\.|\[)/m.test(trailing)) return null
   const openingBrace = projection.indexOf('{', effective.index)
   return extractDelimitedBody(configBody, openingBrace, '{', '}')
 }
@@ -852,7 +1147,8 @@ function activeHeaderEntries(source: string): Map<string, string> {
   }
   for (const object of headerArrays.join('\n').match(/\{[^{}]*\}/g) ?? []) {
     const key = [...object.matchAll(/\bkey\s*:\s*["']([^"']+)["']/g)].at(-1)?.[1]
-    if (key && [...object.matchAll(/\bvalue\s*:/g)].length > 0) entries.set(key, object)
+    const value = [...object.matchAll(/\bvalue\s*:\s*([^,}]+)/g)].at(-1)?.[1]?.trim()
+    if (key && value && /^(?:"[^"\r\n]+"|'[^'\r\n]+'|`[^`]+`)$/i.test(value)) entries.set(key, object)
   }
   return entries
 }
@@ -862,6 +1158,12 @@ function requiresNode24OrNewer(range: string): boolean {
   if (validRange(range) === null) return false
   const minimum = minVersion(range)
   return minimum !== null && minimum.major >= 24
+}
+
+function affirmativeOperationalEvidence(source: string, patterns: readonly RegExp[]): boolean {
+  const negative = /\b(?:no|not|never|without|missing|unconfigured|unsupported|unavailable|disabled|impossible|lack(?:s|ing)?)\b|\b(?:is|are|was|were|do|does|did|can|could|would|should|has|have|had)n['’]t\b/i
+  const lines = source.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !negative.test(line))
+  return patterns.every((pattern) => lines.some((line) => pattern.test(line)))
 }
 
 export const RULES: readonly RuleDefinition[] = [
@@ -966,8 +1268,8 @@ export const RULES: readonly RuleDefinition[] = [
     remediation: 'Serve every public route over HTTPS, redirect HTTP, verify certificate renewal, and set the canonical public origin to the real HTTPS URL.',
     autofix: manual('The remediation is live edge and DNS configuration, not a file the scanner can add. Writing a document would hide an unverified production risk.'),
     check: (context) => {
-      const source = context.collectDeploymentText()
-      const hasTlsRunbook = /\b(?:https|tls|certificate)\b/i.test(source)
+      const source = context.collectOperationalDocs()
+      const hasTlsRunbook = affirmativeOperationalEvidence(source, [/\b(?:https|tls|certificate)\b/i])
       return hasTlsRunbook
         ? { status: 'warning', summary: 'TLS guidance exists, but a static scan cannot verify the live certificate, redirect, DNS, or canonical origin.' }
         : { status: 'fail', summary: 'No deployment guidance records TLS and canonical-origin verification.' }
@@ -981,7 +1283,7 @@ export const RULES: readonly RuleDefinition[] = [
       const inventory = templateInventory(context)
       if (!inventory.names.has('RATE_LIMIT_TRUST_PROXY_DEPTH')) return { status: 'fail', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH is absent from the configuration template.' }
       const depth = inventory.integers.get('RATE_LIMIT_TRUST_PROXY_DEPTH')
-      if (depth !== undefined && depth < 0) return { status: 'fail', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH cannot be negative.' }
+      if (depth === undefined || depth < 0) return { status: 'fail', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH must be a non-negative integer.' }
       return { status: 'warning', summary: 'RATE_LIMIT_TRUST_PROXY_DEPTH is documented; verify its live value matches the deployed proxy chain.' }
     },
   }),
@@ -996,8 +1298,22 @@ export const RULES: readonly RuleDefinition[] = [
       if (installed.has('@open-mercato/checkout')) required.push('CHECKOUT_ALLOWED_ORIGINS')
       if (installed.has('@open-mercato/documents')) required.push('DOCUMENTS_COLLAB_ALLOWED_ORIGINS')
       const missing = required.filter((key) => !inventory.names.has(key))
-      return missing.length
-        ? { status: 'fail', summary: 'Origin allowlist configuration is incomplete.', evidence: missing.map((key) => `Missing template key: ${key}`) }
+      if (missing.length) return { status: 'fail', summary: 'Origin allowlist configuration is incomplete.', evidence: missing.map((key) => `Missing template key: ${key}`) }
+      const invalid = required.filter((key) => {
+        const value = inventory.values.get(key) ?? ''
+        if (!value) return false
+        return value.split(',').map((origin) => origin.trim()).some((origin) => {
+          try {
+            const url = new URL(origin)
+            return url.protocol !== 'https:' || Boolean(url.username || url.password) || url.pathname !== '/' || Boolean(url.search || url.hash)
+              || url.hostname.includes('*')
+          } catch {
+            return true
+          }
+        })
+      })
+      return invalid.length
+        ? { status: 'fail', summary: 'Origin allowlist template values must contain only exact HTTPS origins.', evidence: invalid.map((key) => `Invalid template origin list: ${key}`) }
         : { status: 'warning', summary: 'Origin allowlist keys are present; verify that live values contain only intended HTTPS origins.' }
     },
   }),
@@ -1111,13 +1427,13 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const source = ['docker-compose.yml', 'docker-compose.fullapp.yml', 'railway.toml', 'railway.worker.toml']
         .map((file) => context.readText(file) ?? '').join('\n')
-      const images = [...source.matchAll(/^\s*image\s*[:=]\s*["']?([^\s"']+)/gmi)].map((match) => match[1] ?? '')
+      const images = [...source.matchAll(/^\s*image\s*[:=]\s*(?:"([^"]+)"|'([^']+)'|([^\s#]+))/gmi)]
+        .map((match) => match[1] ?? match[2] ?? match[3] ?? '')
       if (!images.length) return { status: 'warning', summary: 'No in-repository production image reference proves immutable artifact selection.' }
-      const mutable = images.filter((image) => /:latest$|:(?:main|master|develop|dev)$/i.test(image))
-      if (mutable.length) return { status: 'fail', summary: 'Production configuration uses mutable image references.', evidence: mutable.map((image) => `Mutable image reference: ${displayPath(image)}`) }
-      const unpinned = images.filter((image) => !/@sha256:[a-f0-9]{64}$/i.test(image) && !/:[a-f0-9]{7,40}$/i.test(image) && !/github\.sha/i.test(image))
+      const unpinned = images.filter((image) => !/@sha256:[a-f0-9]{64}$/i.test(image) && !/:[a-f0-9]{7,40}$/i.test(image)
+        && !/:\$\{\{\s*github\.sha\s*\}\}$/i.test(image))
       return unpinned.length
-        ? { status: 'warning', summary: 'Image references exist, but the scanner cannot prove they are immutable.', evidence: unpinned.map((image) => `Review image reference: ${displayPath(image)}`) }
+        ? { status: 'fail', summary: 'Production image references are not pinned to a digest or commit-derived identifier.', evidence: unpinned.map((image) => `Unpinned image reference: ${displayPath(image)}`) }
         : { status: 'pass', summary: 'Production image references use a digest or commit-derived identifier.' }
     },
   }),
@@ -1169,8 +1485,19 @@ export const RULES: readonly RuleDefinition[] = [
     check: (context) => {
       const installed = dependencies(context)
       if (!installed.has('@open-mercato/documents') && !installed.has('@open-mercato/core')) return { status: 'skipped', summary: 'No storage-owning Open Mercato package was detected.' }
-      const source = context.collectDeploymentText()
-      return /(?:volume|storage|upload|s3)/i.test(source)
+      const composeStorage = COMPOSE_FILES.some((file) => (composeServices(context, file) ?? []).some(([, service]) => {
+        if (!Array.isArray(service.volumes)) return false
+        return service.volumes.some((volume) => {
+          if (typeof volume === 'string') return /(?:^|:)(?:\/[^:\s]*)?(?:storage|uploads?|documents?|attachments?|media)(?:\/[^:\s]*)?$/i.test(volume)
+          return isRecord(volume) && typeof volume.target === 'string'
+            && /(?:^|\/)(?:storage|uploads?|documents?|attachments?|media)(?:\/|$)/i.test(volume.target)
+            && volume.type !== 'tmpfs'
+        })
+      }))
+      const source = context.collectDeploymentText().replace(/\s+/g, ' ')
+      const durableStorageRunbook = /(?:uploads?|documents?|attachments?|media).{0,160}(?:persistent\s+(?:volume|disk|media)|object\s+storage|s3\b)/i.test(source)
+        || /(?:persistent\s+(?:volume|disk|media)|object\s+storage|s3\b).{0,160}(?:uploads?|documents?|attachments?|media)/i.test(source)
+      return composeStorage || durableStorageRunbook
         ? { status: 'warning', summary: 'Storage configuration is present; verify durability, capacity alerts, and restore coverage in the live environment.' }
         : { status: 'fail', summary: 'No persistent storage configuration or runbook was found.' }
     },
@@ -1186,8 +1513,8 @@ export const RULES: readonly RuleDefinition[] = [
         : [{ kind: 'create-file', path: BACKUP_RUNBOOK_PATH, contents: BACKUP_RUNBOOK_STUB, description: `create the ${BACKUP_RUNBOOK_PATH} stub (TODOs still need an owner and a dated rehearsal)` }],
     },
     check: (context) => {
-      const source = context.collectDeploymentText()
-      return containsAll(source.toLowerCase(), ['backup', 'restore'])
+      const source = context.collectOperationalDocs()
+      return affirmativeOperationalEvidence(source, [/\bback(?:up| up)\b/i, /\brestore\b/i])
         ? { status: 'warning', summary: 'Backup and restore guidance exists; verify current off-site copies and a successful dated restore rehearsal.' }
         : { status: 'fail', summary: 'No backup-and-restore runbook was found.' }
     },
@@ -1202,7 +1529,7 @@ export const RULES: readonly RuleDefinition[] = [
         ? []
         : [{ kind: 'create-file', path: ROLLBACK_RUNBOOK_PATH, contents: ROLLBACK_RUNBOOK_STUB, description: `create the ${ROLLBACK_RUNBOOK_PATH} stub (TODOs still need an owner and a rehearsal)` }],
     },
-    check: (context) => /\brollback\b|\bforward[- ]fix\b/i.test(context.collectDeploymentText())
+    check: (context) => affirmativeOperationalEvidence(context.collectOperationalDocs(), [/\b(?:rollback|forward[- ]fix)\b/i])
       ? { status: 'warning', summary: 'Rollback guidance exists; rehearse it against the actual provider and database change policy.' }
       : { status: 'fail', summary: 'No rollback or forward-fix runbook was found.' },
   }),

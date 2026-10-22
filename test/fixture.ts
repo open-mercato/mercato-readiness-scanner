@@ -38,6 +38,7 @@ const FILES: Record<string, string> = {
   ].join('\n'),
   '.gitignore': [
     '.env',
+    '.env*',
     '.env.production',
     '.env.local',
     '.env.*.local',
@@ -67,7 +68,7 @@ const FILES: Record<string, string> = {
   'railway.worker.toml': '[deploy]\nstartCommand = "yarn mercato worker"\n',
   'docker-compose.fullapp.yml': 'services:\n  app:\n    volumes:\n      - uploads:/app/storage\nvolumes:\n  uploads:\n',
   'docker/otel-collector-config.yaml': 'receivers:\n  otlp:\nexporters:\n  debug:\n',
-  '.github/workflows/release.yml': 'on:\n  push:\n    branches: [main]\njobs:\n  validate:\n    steps:\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n',
+  '.github/workflows/release.yml': 'on:\n  push:\n    branches: [main]\njobs:\n  validate:\n    steps:\n      - uses: actions/checkout@v4\n      - run: yarn generate\n      - run: yarn build\n      - run: yarn test\n      - run: yarn db:migrate --check\n',
   'docs/operations.md': [
     '# Production operations',
     'Use TLS and HTTPS with certificate renewal and the canonical origin.',
@@ -197,4 +198,27 @@ export function makeCezarRunStub(): CezarRunStub {
 
 export function removeFixture(root: string): void {
   fs.rmSync(root, { recursive: true, force: true })
+}
+
+export function makeMonorepoFixture(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'framework-checkout-'))
+  const files: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'open-mercato', private: true, workspaces: ['apps/*', 'packages/*'] }),
+    'packages/core/package.json': JSON.stringify({ name: '@open-mercato/core' }),
+    'packages/create-app/package.json': JSON.stringify({ name: 'create-mercato-app' }),
+    'apps/mercato/package.json': JSON.stringify({
+      name: '@open-mercato/app', dependencies: { '@open-mercato/core': 'workspace:*' },
+    }),
+    'apps/mercato/src/modules.ts': 'export default []\n',
+    'packages/create-app/template/package.json': JSON.stringify({
+      name: 'generated-app', dependencies: { '@open-mercato/core': '1.0.0' },
+    }),
+    'packages/create-app/template/src/modules.ts': 'export default []\n',
+  }
+  for (const [relativePath, contents] of Object.entries(files)) {
+    const destination = path.join(root, relativePath)
+    fs.mkdirSync(path.dirname(destination), { recursive: true })
+    fs.writeFileSync(destination, contents)
+  }
+  return root
 }

@@ -79,7 +79,7 @@ export function buildAgentPrompt(input: PromptInput): string {
     '- Never commit secrets, and never put a real secret value in a tracked file.',
     '- Do not delete or truncate existing files; make the smallest additive change that satisfies the rule.',
     '- Do not weaken, delete, or skip existing tests or CI steps to make a rule pass.',
-    '- Keep the repository working: run the project\'s own validation commands after changing it.',
+    '- Never execute the target application scripts or load application code. List validation commands for the operator to run separately.',
     '',
     '## Definition of done',
     '',
@@ -133,10 +133,11 @@ export function agentInvocation(binary: AgentBinary, prompt: string, root: strin
   return { command: binary.command, args: ['run', prompt, '--repo', root, ...(workflow ? ['--workflow', workflow] : [])] }
 }
 
-export function spawnAgent(invocation: AgentInvocation): number {
-  const result = spawnSync(invocation.command, invocation.args, { stdio: 'inherit' })
+export function spawnAgent(invocation: AgentInvocation, timeoutMs = 15 * 60_000): number {
+  const result = spawnSync(invocation.command, invocation.args, { stdio: 'inherit', timeout: timeoutMs })
   if (result.error) {
     const code = (result.error as NodeJS.ErrnoException).code
+    if (code === 'ETIMEDOUT') throw new AgentUnavailableError('cezar-run exceeded the execution timeout; inspect the target working tree for partial changes.')
     if (code === 'ENOENT') throw new AgentUnavailableError(`cezar-run was not found as "${invocation.command}". Install it, or point --cezar-run / ${CEZAR_RUN_ENV} at the binary.`)
     throw result.error
   }

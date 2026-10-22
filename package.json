@@ -1,10 +1,10 @@
 {
-  "name": "@open-mercato/mercato-readiness-scanner",
+  "name": "mercato-readiness-scanner",
   "version": "0.1.0",
   "description": "Static production-readiness scanner for Open Mercato applications.",
-  "private": true,
   "type": "module",
   "bin": {
+    "mercato-readiness-scanner": "dist/cli.js",
     "mercato-readiness": "dist/cli.js"
   },
   "files": [
@@ -21,8 +21,9 @@
     "test": "node --import tsx --test test/*.test.ts",
     "test:built": "node --test test-built/*.test.mjs",
     "pack:check": "node scripts/check-package.mjs",
-    "registry:check": "node scripts/check-private-registry.mjs",
-    "check": "npm run typecheck && npm test && npm run build && npm run test:built && npm run pack:check && npm run registry:check"
+    "registry:check": "node scripts/check-registry.mjs",
+    "check": "npm run typecheck && npm test && npm run build && npm run test:built && npm run pack:check && npm run registry:check",
+    "prepublishOnly": "npm run check"
   },
   "devDependencies": {
     "@types/node": "^26.4.0",
@@ -33,5 +34,17 @@
   "dependencies": {
     "semver": "^7.8.5",
     "yaml": "^2.9.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/open-mercato/mercato-readiness-scanner.git"
+  },
+  "homepage": "https://github.com/open-mercato/mercato-readiness-scanner#readme",
+  "bugs": {
+    "url": "https://github.com/open-mercato/mercato-readiness-scanner/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }

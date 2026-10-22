@@ -5,6 +5,8 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { RULES } from '../src/rules.js'
+import { applyPlan, ApplyRefusedError } from '../src/apply.js'
+import { spawnAgent, AgentUnavailableError } from '../src/agent.js'
 import { scan } from '../src/scan.js'
 import { commitFixture, DEFAULT_FIXTURE_FILES, fixtureStatus, makeAppFixture, makeCezarRunStub, makeReportDirectory, removeFixture } from './fixture.js'
 
@@ -247,7 +249,7 @@ test('errors instead of prompting when stdin is not a TTY, and succeeds with the
 test('a dry run reports the plan and writes nothing', () => {
   const root = makeAppFixture({ files: brokenFiles(), git: 'commit' })
   try {
-    const result = run(['apply', root, '--dry-run', '--no-color'])
+    const result = run(['apply', root, '--dry-run', '--no-color', '--markdown', path.join(root, 'preview.md'), '--json', path.join(root, 'preview.json'), '--output', path.join(root, 'preview.txt')])
     assert.equal(result.status, 0, result.stderr)
     assert.match(result.stdout, /Dry run: nothing was written/)
     assert.match(result.stdout, /change\(s\) planned/)
@@ -267,13 +269,13 @@ test('agent mode builds a prompt that references the saved report and never spaw
     const printed = run(['apply', root, '--mode', 'agent', '--markdown', reportPath, '--print-prompt', '--no-color'])
     assert.equal(printed.status, 0, printed.stderr)
     assert.match(printed.stdout, /^# Task: apply Open Mercato production-readiness remediations$/m)
-    assert.match(printed.stdout, new RegExp(`Read the full saved report first: ${reportPath.replaceAll('.', '\\.')}`))
+    assert.match(printed.stdout, /## Readiness report \(inlined\)/)
     assert.match(printed.stdout, /### runtime-env-template \(high, fail\)/)
     assert.match(printed.stdout, /docs\/rules\/runtime-env-template\.md/)
     assert.match(printed.stdout, /Never read, write, or print the contents of any value-bearing/)
     assert.match(printed.stdout, /## Definition of done/)
-    assert.doesNotMatch(printed.stdout, /## Readiness report \(inlined\)/)
-    assert.match(fs.readFileSync(reportPath, 'utf8'), /^# Open Mercato production readiness report/m)
+    assert.equal(fs.existsSync(reportPath), false, 'printing a prompt must not save reports')
+    assert.match(printed.stdout, /Never execute the target application scripts/)
     assert.equal(stub.invocation(), null)
 
     const inlined = run(['apply', root, '--mode', 'agent', '--print-prompt', '--no-color'])
@@ -330,4 +332,30 @@ test('apply-only flags and scan-only flags stay separate, and scan stays read-on
   } finally {
     removeFixture(root)
   }
+})
+
+
+test('apply rejects environment templates, symlinks, and traversal even through the public plan API', () => {
+  const root = makeAppFixture()
+  const outside = makeReportDirectory()
+  try {
+    fs.symlinkSync(outside, path.join(root, 'linked'))
+    for (const file of ['.env', '.env.example', '.env.sample', '.env.template', 'deployment.pem', '../escape.txt', 'linked/escape.txt']) {
+      assert.throws(() => applyPlan({ root, skipped: [], planned: [{
+        id: 'test', title: 'test', severity: 'high', actions: [{ kind: 'create-file', path: file, contents: 'not written', description: 'test' }],
+      }] }, false), ApplyRefusedError)
+    }
+    assert.equal(fs.existsSync(path.join(outside, 'escape.txt')), false)
+  } finally {
+    removeFixture(root)
+    removeFixture(outside)
+  }
+})
+
+test('agent invocation times out instead of hanging indefinitely', () => {
+  assert.throws(() => spawnAgent({ command: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'] }, 50), (error: unknown) => {
+    assert.ok(error instanceof AgentUnavailableError)
+    assert.match(error.message, /exceeded the execution timeout/)
+    return true
+  })
 })

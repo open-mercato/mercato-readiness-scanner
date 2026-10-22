@@ -44,9 +44,9 @@ class PreconditionError extends Error {
 const HELP = `Open Mercato production-readiness scanner
 
 Usage:
-  mercato-readiness scan [path] [options]
-  mercato-readiness apply [path] [options]
-  mercato-readiness [path] [options]
+  mercato-readiness-scanner scan [path] [options]
+  mercato-readiness-scanner apply [path] [options]
+  mercato-readiness-scanner [path] [options]
 
 Options:
   --format <terminal|markdown|json>  stdout format (default: terminal)
@@ -80,12 +80,12 @@ never touches .env* or credential files, and never runs the target's scripts. Th
 must be a git working tree, because git is the only undo for those writes.
 
 Examples:
-  mercato-readiness scan .
-  mercato-readiness scan . --markdown readiness.md --json readiness.json
-  mercato-readiness scan . --format json --output readiness.json --fail-on high
-  mercato-readiness apply . --dry-run
-  mercato-readiness apply . --yes
-  mercato-readiness apply . --mode agent --markdown readiness.md --print-prompt
+  mercato-readiness-scanner scan .
+  mercato-readiness-scanner scan . --markdown readiness.md --json readiness.json
+  mercato-readiness-scanner scan . --format json --output readiness.json --fail-on high
+  mercato-readiness-scanner apply . --dry-run
+  mercato-readiness-scanner apply . --yes
+  mercato-readiness-scanner apply . --mode agent --markdown readiness.md --print-prompt
 `
 
 const APPLY_ONLY_FLAGS = ['--mode', '--yes', '--non-interactive', '--allow-dirty', '--dry-run', '--print-prompt', '--cezar-run', '--workflow'] as const
@@ -252,7 +252,7 @@ async function runApply(options: Options): Promise<number> {
   const target = resolveTarget(options.start)
   if (!options.printPrompt) requireRevertableWorktree(target.root, options.allowDirty)
   const report = scanTarget(target)
-  const reportPath = saveReports(report, options)
+  const reportPath = options.dryRun || options.printPrompt ? undefined : saveReports(report, options)
   const plan = planApply(target, report)
   if (options.mode === 'agent') return runAgentApply(options, target.root, report, plan, reportPath)
   if (options.dryRun) {

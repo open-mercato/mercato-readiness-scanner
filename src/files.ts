@@ -156,7 +156,22 @@ function collectTextFiles(root: string, relativeRoot: string, allowed: RegExp): 
 
 export function collectDeploymentText(root: string): string {
   const files = [...DEPLOYMENT_FILES, ...collectTextFiles(root, 'docs', /\.(?:md|mdx|txt)$/i)]
-  return files.map((file) => readSafeText(root, file)).filter((value): value is string => value !== null).join('\n')
+  return files.flatMap((file) => {
+    const source = readSafeText(root, file)
+    if (source === null) return []
+    if (/\.(?:md|mdx|txt)$/i.test(file)) return [source]
+    return [source.split(/\r?\n/).filter((line) => !/^\s*#/.test(line)).join('\n')]
+  }).join('\n')
+}
+
+export function collectOperationalDocs(root: string): string {
+  const files = ['.ai/guides/production-deployment.md', ...collectTextFiles(root, 'docs', /\.(?:md|mdx|txt)$/i)]
+  return files.flatMap((file) => {
+    const source = readSafeText(root, file)
+    if (source === null) return []
+    const withoutComments = source.replace(/<!--[\s\S]*?-->/g, '')
+    return [withoutComments.split(/\r?\n/).filter((line) => !/\b(?:TODO|TBD)\b/i.test(line)).join('\n')]
+  }).join('\n')
 }
 
 export function collectCiText(root: string): string {
