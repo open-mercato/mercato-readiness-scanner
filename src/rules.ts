@@ -1168,6 +1168,30 @@ function affirmativeOperationalEvidence(source: string, patterns: readonly RegEx
 
 export const RULES: readonly RuleDefinition[] = [
   rule({
+    id: 'secrets-credential-strength', title: 'Credentials reject weak values and published defaults', category: 'Secrets', severity: 'critical',
+    remediation: 'Replace weak, empty, copied-template, or default JWT secrets, database/service passwords, and API credentials with independently generated production values. Use at least 32 random bytes for signing keys and 16 characters for passwords. Rotate exposed values through your deployment secret mechanism.',
+    autofix: manual('Credential generation and rotation require operator decisions and can invalidate sessions or service access; apply never reads or changes live credentials.'),
+    check: (context) => context.inspectCredentials().credentials,
+  }),
+  rule({
+    id: 'secrets-encryption-key-strength', title: 'Encryption keys reject weak fallbacks and development defaults', category: 'Secrets', severity: 'critical',
+    remediation: 'Use unique, securely generated encryption keys with at least 32 bytes of key material. Remove development defaults and unsafe derived fallback settings. Preserve the existing key securely and follow a migration plan before rotating keys for encrypted data.',
+    autofix: manual('Replacing encryption keys can make stored data unreadable; key migration, custody, and rotation must be handled by an operator.'),
+    check: (context) => context.inspectCredentials().encryption,
+  }),
+  rule({
+    id: 'secrets-kms-configuration', title: 'KMS configuration and key custody are verified', category: 'Secrets', severity: 'high',
+    remediation: 'Configure the Open Mercato Vault KMS with VAULT_ADDR and VAULT_TOKEN. Without KMS, deploy durable encryption keys through Railway or Cloudflare secrets, or inject GitHub Actions secrets during deployment. Do not ship plaintext .env files. Verify access policies, key backup, recovery, and rotation separately.',
+    autofix: manual('KMS provisioning and secret injection require deployment access; static configuration cannot prove live key custody or recovery.'),
+    check: (context) => context.inspectCredentials().kms,
+  }),
+  rule({
+    id: 'secrets-deployment-injection', title: 'Production secrets are injected through a secret mechanism', category: 'Secrets', severity: 'high',
+    remediation: 'Keep production keys and passwords out of release artifacts and plaintext .env files. Inject them using Railway or Cloudflare secrets, a secret manager, or GitHub Actions secrets during deployment. Restrict access and retain encryption keys for recovery; a secret store does not replace KMS capabilities.',
+    autofix: manual('Secret delivery is provider-specific deployment configuration; apply cannot provision a secret mechanism or verify the deployed artifact.'),
+    check: (context) => context.inspectCredentials().delivery,
+  }),
+  rule({
     id: 'secrets-live-env-untracked', title: 'Live environment files are not tracked', category: 'Secrets', severity: 'critical',
     remediation: 'Remove value-bearing .env files from version control, rotate exposed credentials, and keep only sanitized example/sample/template files.',
     autofix: manual('Removing history and rotating leaked credentials destroys data and needs operator decisions; the scanner never touches value-bearing .env files.'),

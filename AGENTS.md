@@ -5,7 +5,8 @@
 - Keep `scan` read-only with respect to the scanned application. `scan` is the default command
   and must never create, modify, or delete a file in the target. The only exception to the
   read-only invariant is the explicit, opt-in `apply` command described below.
-- Never read value-bearing `.env*` files, credentials, private keys, token caches, or secret stores.
+- Keep credential values out of tools, logs, reports, prompts, and evidence. Never read private-key files, token caches, or secret stores.
+- Default scans never read value-bearing `.env*` files. The explicit, user-requested `scan --check-secrets` exception inspects only bounded local production dotenv files, Compose settings, and visible runtime configuration in memory. Never run it on a real application during development; use synthetic fixtures. Never follow links or upload values. `apply` retains its no-credential-reading rule.
 - Keep findings deterministic and evidence free of secret values and absolute home paths.
 - Give every rule a stable ID and its own matching `docs/rules/<rule-id>.md` page.
 - Preserve the JSON schema version and document incompatible report changes.

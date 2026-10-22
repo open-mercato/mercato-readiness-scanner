@@ -22,6 +22,7 @@ type Options = {
   markdown?: string
   json?: string
   color: boolean
+  checkSecrets: boolean
   failOn: Severity | 'never'
   mode: ApplyMode
   assumeYes: boolean
@@ -57,6 +58,8 @@ Options:
   --fail-on <critical|high|medium|low|never>
                                     scan only: return exit 1 when a failed rule meets
                                     the threshold (default: never)
+  --check-secrets                   scan only: inspect local production credentials in
+                                    memory; report names and reasons, never values
   --no-color                        disable ANSI colors
   --help                            show help
   --version                         show version
@@ -109,13 +112,17 @@ function parseArgs(argv: string[]): Options | 'help' | 'version' {
   if (args.includes('--version') || args.includes('-v')) return 'version'
   const options: Options = {
     command, start: '.', format: 'terminal', formatExplicit: false, color: process.stdout.isTTY, failOn: 'never',
-    mode: 'direct', assumeYes: false, allowDirty: false, dryRun: false, printPrompt: false,
+    checkSecrets: false, mode: 'direct', assumeYes: false, allowDirty: false, dryRun: false, printPrompt: false,
   }
   const applyOnly = (token: string): void => {
     if (command !== 'apply') throw new CliUsageError(`${token} is only valid for "mercato-readiness apply".`)
   }
   for (let index = 0; index < args.length;) {
     const token = args[index]
+    if (token === '--check-secrets') {
+      if (command !== 'scan') throw new CliUsageError('--check-secrets is only valid for scan; apply never reads live credentials.')
+      options.checkSecrets = true; args.splice(index, 1); continue
+    }
     if (token === '--no-color') { options.color = false; args.splice(index, 1); continue }
     if (token === '--format') {
       const value = takeValue(args, index, token)
@@ -208,7 +215,7 @@ async function confirm(question: string, options: Options): Promise<void> {
 }
 
 function runScan(options: Options): number {
-  const report = scan(options.start)
+  const report = scan(options.start, new Date(), { checkSecrets: options.checkSecrets })
   const stdout = render(report, options.format, options.color)
   if (!options.output || options.output === '-') out(stdout)
   else writeReport(options.output, stdout)

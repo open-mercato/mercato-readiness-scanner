@@ -1,4 +1,6 @@
 import fs from 'node:fs'
+import { inspectLocalCredentials } from './credential-files.js'
+import type { CredentialInspection } from './credential-files.js'
 import path from 'node:path'
 import { collectCiText, collectCiWorkflows, collectDeploymentText, collectOperationalDocs, existsInside, gitTrackedFiles, readSafeText } from './files.js'
 import type { ScanContext } from './types.js'
@@ -59,12 +61,14 @@ export function findScanTarget(start: string): ScanTarget | null {
   }
 }
 
-export function createScanContext(root: string): ScanContext {
+export function createScanContext(root: string, options: { checkSecrets?: boolean, credentialEnvironment?: Readonly<Record<string, string | undefined>> } = {}): ScanContext {
   const packageJson = readPackageJson(root)
   if (!packageJson) throw new Error('The Open Mercato app package.json could not be read.')
+  let inspection: CredentialInspection | undefined
   return {
     root,
     packageJson,
+    inspectCredentials: () => inspection ??= inspectLocalCredentials(root, options.checkSecrets === true, options.credentialEnvironment),
     trackedFiles: gitTrackedFiles(root),
     exists: (relativePath) => existsInside(root, relativePath),
     readText: (relativePath) => readSafeText(root, relativePath),

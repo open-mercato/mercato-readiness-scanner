@@ -72,7 +72,7 @@ export function readSafeText(root: string, relativePath: string): string | null 
   if (!absolute) return null
   try {
     const stat = fs.lstatSync(absolute)
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_TEXT_BYTES || !resolvesWithinRoot(root, absolute)) return null
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > MAX_TEXT_BYTES || !resolvesWithinRoot(root, absolute)) return null
     return fs.readFileSync(absolute, 'utf8')
   } catch {
     return null

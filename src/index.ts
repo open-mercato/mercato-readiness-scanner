@@ -1,5 +1,5 @@
 export { InvalidTargetError, resolveTarget, scan, scanTarget, VERSION } from './scan.js'
-export type { ResolvedTarget } from './scan.js'
+export type { ResolvedTarget, ScanOptions } from './scan.js'
 export { RULES } from './rules.js'
 export { applyPlan, ApplyRefusedError, planApply } from './apply.js'
 export { agentInvocation, AgentUnavailableError, buildAgentPrompt, CEZAR_RUN_ENV, resolveAgentBinary } from './agent.js'

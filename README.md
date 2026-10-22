@@ -62,6 +62,51 @@ The default terminal report groups failed, review-only, skipped, and passing
 checks with `❌`, `⚠️`, `⏭️`, and `✅` markers. Every actionable result includes
 remediation text and a permanent rule-documentation URL.
 
+## Check credentials and encryption keys
+
+Enable local credential inspection explicitly:
+
+```bash
+npx mercato-readiness-scanner@0.2.0 scan . --check-secrets --fail-on high
+```
+
+`--check-secrets` inspects root `.env`, `.env.production`, `.env.local`, and
+`.env.production.local` files, visible runtime settings, and supported Compose
+service environments. It checks every detected credential-like setting, including
+JWT/signing secrets, database and Redis passwords, other service passwords,
+API tokens/keys, and tenant encryption fallback/master keys. Database URL
+passwords, copied template credentials, and `${NAME:-default}` fallbacks are
+included. File contents remain in memory; findings contain variable names and
+fixed reasons, never credential values. Application code and shell expressions
+are never executed. `apply` does not read or change these values.
+
+| Finding | Behavior |
+|---|---|
+| ❌ Default, placeholder, or copied template credential | Critical failure |
+| ❌ Short, repeated, or predictable credential | Critical failure |
+| ❌ Weak tenant encryption fallback/master key | Critical failure |
+| ❌ Development fallback enabled without an explicit tenant key | Critical failure |
+| ⚠️ No complete KMS configuration | Configure Vault; inject durable keys through a secret mechanism |
+| ⚠️ Local production `.env` paths | Verify secrets are excluded from deployed artifacts |
+| ⚠️ Missing, unresolved, or uninspectable credentials | Verify deployment-injected settings separately |
+
+Signing and encryption keys require at least **32 bytes** of key material;
+passwords require at least **16 characters**. Recognized hex/base64 keys are
+checked after decoding. These heuristics cannot prove randomness or credential
+validity. Private-key files, secret stores, external Compose `env_file` paths,
+and application code are not inspected. See the
+[credential rule](docs/rules/secrets-credential-strength.md) for coverage and limits.
+
+**Without KMS, inject encryption keys using Railway or Cloudflare secrets, a
+secret manager, or GitHub Actions secrets during deployment. Do not deploy keys
+in a plaintext `.env` file.** Keep durable recovery copies and plan key rotation:
+replacing an existing encryption key can make stored data unreadable. A hosting
+secret mechanism delivers values; KMS also manages encryption-key operations.
+
+Default scans keep live credential values unread and mark the two strength
+checks as skipped. KMS and secret-delivery review warnings appear in every scan.
+Even with Vault settings present, live KMS access and recovery need verification.
+
 ## Save a report
 
 Keep the formatted terminal report on screen while writing both portable
@@ -89,7 +134,7 @@ Pin the scanner version and fail the job on high or critical findings while
 saving a JSON report:
 
 ```bash
-npx --yes mercato-readiness-scanner@0.1.0 scan . --json readiness.json --fail-on high
+npx --yes mercato-readiness-scanner@0.2.0 scan . --json readiness.json --fail-on high
 ```
 
 `--fail-on` accepts `critical`, `high`, `medium`, `low`, or `never` (the default).
@@ -204,11 +249,11 @@ target guard runs before readiness checks or report output, regardless of
 `--fail-on` or report format. Generated applications in unrelated workspaces
 remain supported.
 
-Live `.env*` files are never opened. Git is queried only for tracked path names
-so the scanner can report a committed live environment file without reading its
-contents. Repository hooks, filesystem monitors, and optional Git locks are
+Default scans never open live `.env*` files. Explicit `scan --check-secrets`
+adds bounded, in-memory credential inspection as described above. Git is queried
+only for tracked path names to identify committed environment files. Repository hooks, filesystem monitors, and optional Git locks are
 disabled for that read-only query. Only the explicitly sanitized `.env.example`, `.env.sample`, and
-`.env.template` forms are eligible for configuration-name checks. Evidence omits
+`.env.template` forms are eligible for the default template configuration checks. Evidence omits
 absolute paths and configuration values.
 
 Static evidence cannot prove live TLS, backups, restores, alerts, or provider
@@ -222,6 +267,10 @@ also stable machine keys in the JSON report.
 
 | Severity | Best practice |
 |---|---|
+| 🔴 Critical | [Credentials reject weak values and published defaults](docs/rules/secrets-credential-strength.md) |
+| 🔴 Critical | [Encryption keys reject weak fallbacks and development defaults](docs/rules/secrets-encryption-key-strength.md) |
+| 🟠 High | [KMS configuration and key custody are verified](docs/rules/secrets-kms-configuration.md) |
+| 🟠 High | [Production secrets are injected through a secret mechanism](docs/rules/secrets-deployment-injection.md) |
 | 🔴 Critical | [Live environment files are not tracked](docs/rules/secrets-live-env-untracked.md) |
 | 🔴 Critical | [Credential and private-key files are not tracked](docs/rules/secrets-no-tracked-credentials.md) |
 | 🟠 High | [Sensitive local files are ignored](docs/rules/secrets-ignore-policy.md) |
@@ -257,7 +306,8 @@ The overall operational baseline is the Open Mercato
 JSON output follows [`docs/report.schema.json`](docs/report.schema.json). It
 contains the scanner version, scan timestamp, target directory name, aggregate
 counts, and one result per rule. Consumers should key on `schemaVersion` and
-`results[].id`, not display text. Schema version 1 retains the original
+`results[].id`, not display text. Version 0.2.0 adds four rule results; the
+JSON shape and `schemaVersion: 1` are unchanged. Schema version 1 retains the original
 `tool.name` value, `@open-mercato/mercato-readiness-scanner`, for compatibility;
 the npm package and primary CLI command are `mercato-readiness-scanner`.
 

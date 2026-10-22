@@ -1,3 +1,5 @@
+import type { CredentialInspection } from './credential-files.js'
+
 export type Severity = 'critical' | 'high' | 'medium' | 'low'
 export type FindingStatus = 'pass' | 'fail' | 'warning' | 'skipped'
 
@@ -110,6 +112,7 @@ export type ScanContext = {
   root: string
   packageJson: Record<string, unknown>
   trackedFiles: ReadonlySet<string> | null
+  inspectCredentials: () => CredentialInspection
   exists: (relativePath: string) => boolean
   readText: (relativePath: string) => string | null
   collectDeploymentText: () => string
