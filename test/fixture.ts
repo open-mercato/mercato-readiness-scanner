@@ -97,3 +97,26 @@ export function makeAppFixture(): string {
 export function removeFixture(root: string): void {
   fs.rmSync(root, { recursive: true, force: true })
 }
+
+export function makeMonorepoFixture(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'framework-checkout-'))
+  const files: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'open-mercato', private: true, workspaces: ['apps/*', 'packages/*'] }),
+    'packages/core/package.json': JSON.stringify({ name: '@open-mercato/core' }),
+    'packages/create-app/package.json': JSON.stringify({ name: 'create-mercato-app' }),
+    'apps/mercato/package.json': JSON.stringify({
+      name: '@open-mercato/app', dependencies: { '@open-mercato/core': 'workspace:*' },
+    }),
+    'apps/mercato/src/modules.ts': 'export default []\n',
+    'packages/create-app/template/package.json': JSON.stringify({
+      name: 'generated-app', dependencies: { '@open-mercato/core': '1.0.0' },
+    }),
+    'packages/create-app/template/src/modules.ts': 'export default []\n',
+  }
+  for (const [relativePath, contents] of Object.entries(files)) {
+    const destination = path.join(root, relativePath)
+    fs.mkdirSync(path.dirname(destination), { recursive: true })
+    fs.writeFileSync(destination, contents)
+  }
+  return root
+}

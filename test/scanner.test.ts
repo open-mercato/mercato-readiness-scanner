@@ -7,8 +7,62 @@ import { fileURLToPath } from 'node:url'
 import { readSafeText } from '../src/files.js'
 import { formatJson, formatMarkdown, formatTerminal } from '../src/formatters.js'
 import { RULES } from '../src/rules.js'
-import { scan } from '../src/scan.js'
-import { makeAppFixture, removeFixture } from './fixture.js'
+import { InvalidTargetError, scan } from '../src/scan.js'
+import { makeAppFixture, makeMonorepoFixture, removeFixture } from './fixture.js'
+
+test('rejects the framework monorepo from the root, internal app, packages, and template', () => {
+  const root = makeMonorepoFixture()
+  try {
+    for (const relativePath of ['', 'apps/mercato', 'apps/mercato/src', 'apps/mercato/src/modules.ts', 'packages/core', 'packages/create-app/template/src']) {
+      assert.throws(() => scan(path.join(root, relativePath)), (error: unknown) => {
+        assert.ok(error instanceof InvalidTargetError)
+        assert.match(error.message, /\[runtime-standalone-application\]/)
+        assert.match(error.message, /monorepo is not a valid way to start a production app/)
+        assert.match(error.message, /create-mercato-app/)
+        assert.equal(error.message.includes(root), false)
+        return true
+      })
+    }
+    // A root that also matches generated-app markers must still be rejected.
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+    manifest.dependencies = { '@open-mercato/core': 'workspace:*' }
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify(manifest))
+    fs.mkdirSync(path.join(root, 'src'))
+    fs.writeFileSync(path.join(root, 'src/modules.ts'), 'export default []\n')
+    assert.throws(() => scan(root), /monorepo is not a valid way to start a production app/)
+  } finally {
+    removeFixture(root)
+  }
+})
+
+test('recognizes a renamed framework package with object-form workspaces', () => {
+  const root = makeMonorepoFixture()
+  try {
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+      name: 'renamed-framework', workspaces: { packages: ['apps/*', 'packages/*'] },
+    }))
+    assert.throws(() => scan(path.join(root, 'apps/mercato/src')), /create-mercato-app/)
+  } finally {
+    removeFixture(root)
+  }
+})
+
+test('supports generated apps in unrelated workspaces without following external package markers', () => {
+  const root = makeAppFixture()
+  const outside = makeMonorepoFixture()
+  try {
+    const manifest = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'))
+    manifest.name = 'open-mercato'
+    manifest.workspaces = ['packages/*']
+    fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify(manifest))
+    assert.equal(scan(root).results.length, RULES.length)
+    fs.symlinkSync(path.join(outside, 'packages'), path.join(root, 'packages'))
+    assert.equal(scan(root).results.length, RULES.length)
+  } finally {
+    removeFixture(root)
+    removeFixture(outside)
+  }
+})
 
 test('scans a generated application and returns one result per documented rule', () => {
   const root = makeAppFixture()
