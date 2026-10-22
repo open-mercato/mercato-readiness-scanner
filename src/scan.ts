@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { createScanContext, findScanTarget } from './app.js'
 import { RULES } from './rules.js'
-import type { ScanReport, ScanSummary } from './types.js'
+import type { ScanContext, ScanReport, ScanSummary } from './types.js'
 
 export const VERSION = '0.1.0'
 
@@ -13,15 +13,30 @@ function displayName(value: string): string {
   return value.replace(/[\u0000-\u001F\u007F]/g, '?').slice(0, 160) || 'open-mercato-app'
 }
 
-export function scan(start: string, now = new Date()): ScanReport {
+export type ResolvedTarget = {
+  root: string
+  context: ScanContext
+}
+
+/** Locates the application and builds its read-only scan context, or throws InvalidTargetError. */
+export function resolveTarget(start: string): ResolvedTarget {
   const target = findScanTarget(start)
   if (!target) throw new InvalidTargetError('No create-mercato-app application was found here or in a parent directory.')
   if (target.kind === 'monorepo') {
     throw new InvalidTargetError('[runtime-standalone-application] The Open Mercato monorepo is not a valid way to start a production app. Create a standalone application with create-mercato-app and run the readiness scanner there.')
   }
   const { root } = target
-  const context = createScanContext(root)
-  const results = RULES.map(({ check, ...metadata }) => {
+  return { root, context: createScanContext(root) }
+}
+
+export function scan(start: string, now = new Date()): ScanReport {
+  return scanTarget(resolveTarget(start), now)
+}
+
+export function scanTarget({ root, context }: ResolvedTarget, now = new Date()): ScanReport {
+  // `autofix` is dropped here on purpose: it is apply-mode metadata, not part of the
+  // versioned report contract in docs/report.schema.json.
+  const results = RULES.map(({ check, autofix, ...metadata }) => {
     const outcome = check(context)
     return { ...metadata, ...outcome, evidence: outcome.evidence ?? [] }
   })

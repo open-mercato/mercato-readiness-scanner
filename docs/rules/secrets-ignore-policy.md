@@ -17,4 +17,10 @@ The scanner evaluates ordered negations, so a later re-inclusion of one of these
 paths fails the rule. Verify the policy with `git check-ignore` before handling
 production values.
 
+## Automatic fix
+
+`mercato-readiness apply` can fix this rule: it appends only the missing patterns to
+`.gitignore`, or creates the file when it is absent. Existing lines are never rewritten, and the
+exceptions you keep for sanitized templates are left alone.
+
 See [Prepare the production environment and secrets](https://docs.openmercato.com/deployment/production-readiness#ordered-production-checklist).

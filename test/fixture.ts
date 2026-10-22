@@ -80,18 +80,120 @@ const FILES: Record<string, string> = {
   'yarn.lock': '# fixture lockfile\n',
 }
 
-export function makeAppFixture(): string {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mercato-readiness-'))
-  for (const [relativePath, contents] of Object.entries(FILES)) {
+/**
+ * `git: 'none'` leaves the fixture outside version control, `'init'` stages everything without a
+ * commit (so the worktree is dirty), and `'commit'` produces a clean, revertable worktree.
+ * A `files` entry set to `null` omits that default file.
+ */
+export type FixtureOptions = {
+  files?: Record<string, string | null>
+  git?: 'none' | 'init' | 'commit'
+}
+
+function git(root: string, args: string[]): void {
+  const result = spawnSync('git', args, { cwd: root, encoding: 'utf8' })
+  if (result.status !== 0) throw new Error(`git ${args.join(' ')} failed for test fixture: ${result.stderr}`)
+}
+
+function insideWorktree(directory: string): boolean {
+  const result = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: directory, encoding: 'utf8' })
+  return result.status === 0 && result.stdout.trim() === 'true'
+}
+
+/**
+ * Picks a base directory that is genuinely outside any git worktree, so the non-git fixture is
+ * really ungoverned. `TMPDIR` can point inside a checkout, which would silently make the
+ * "not a git working tree" case untestable.
+ */
+function nonRepositoryBase(): string {
+  for (const candidate of [os.tmpdir(), '/tmp', path.join(os.homedir(), '.cache'), os.homedir()]) {
+    if (!candidate || !fs.existsSync(candidate)) continue
+    let probe: string
+    try {
+      probe = fs.mkdtempSync(path.join(candidate, 'mercato-readiness-probe-'))
+    } catch {
+      continue
+    }
+    let usable = !insideWorktree(probe)
+    try {
+      // A candidate can exist, be ungoverned, and still be out of quota.
+      fs.writeFileSync(path.join(probe, 'probe'), 'probe')
+    } catch {
+      usable = false
+    }
+    fs.rmSync(probe, { recursive: true, force: true })
+    if (usable) return candidate
+  }
+  throw new Error('no writable directory outside a git worktree is available for the non-git fixture')
+}
+
+/** The default fixture tree, exported so tests can derive deliberately broken variants. */
+export const DEFAULT_FIXTURE_FILES: Readonly<Record<string, string>> = FILES
+
+export function makeAppFixture(options: FixtureOptions = {}): string {
+  const base = options.git === 'none' ? nonRepositoryBase() : os.tmpdir()
+  const root = fs.mkdtempSync(path.join(base, 'mercato-readiness-'))
+  for (const [relativePath, contents] of Object.entries({ ...FILES, ...options.files })) {
+    if (contents === null) continue
     const destination = path.join(root, relativePath)
     fs.mkdirSync(path.dirname(destination), { recursive: true })
     fs.writeFileSync(destination, contents)
   }
-  const init = spawnSync('git', ['init', '--quiet'], { cwd: root })
-  if (init.status !== 0) throw new Error('git init failed for test fixture')
-  const add = spawnSync('git', ['add', '.'], { cwd: root })
-  if (add.status !== 0) throw new Error('git add failed for test fixture')
+  const mode = options.git ?? 'init'
+  if (mode === 'none') return root
+  git(root, ['init', '--quiet'])
+  git(root, ['add', '.'])
+  if (mode === 'commit') {
+    git(root, ['-c', 'user.name=Readiness Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '--no-gpg-sign', '-m', 'fixture baseline'])
+  }
   return root
+}
+
+/** Porcelain status of a fixture, used to prove an apply changed nothing on a second run. */
+export function fixtureStatus(root: string): string {
+  return spawnSync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }).stdout
+}
+
+/** Commits whatever an apply just wrote, which is the real workflow before a second apply. */
+export function commitFixture(root: string, message: string): void {
+  git(root, ['add', '-A'])
+  git(root, ['-c', 'user.name=Readiness Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '--quiet', '--no-gpg-sign', '-m', message])
+}
+
+/** A scratch directory for saved reports, deliberately outside the scanned application. */
+export function makeReportDirectory(): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'mercato-readiness-report-'))
+}
+
+const CEZAR_RUN_STUB = `#!/usr/bin/env node
+import fs from 'node:fs'
+import path from 'node:path'
+import process from 'node:process'
+import { fileURLToPath } from 'node:url'
+
+const here = path.dirname(fileURLToPath(import.meta.url))
+fs.writeFileSync(path.join(here, 'invocation.json'), JSON.stringify({ argv: process.argv.slice(2) }, null, 2))
+process.stdout.write('stub cezar-run invoked\\n')
+`
+
+export type CezarRunStub = {
+  /** Path to pass as --cezar-run; never a real agent. */
+  binary: string
+  /** Reads what the stub was invoked with, or null when it was never spawned. */
+  invocation: () => { argv: string[] } | null
+  remove: () => void
+}
+
+export function makeCezarRunStub(): CezarRunStub {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mercato-readiness-cezar-'))
+  const binary = path.join(directory, 'cezar-run.mjs')
+  const log = path.join(directory, 'invocation.json')
+  fs.writeFileSync(binary, CEZAR_RUN_STUB, { mode: 0o755 })
+  return {
+    binary,
+    invocation: () => fs.existsSync(log) ? JSON.parse(fs.readFileSync(log, 'utf8')) as { argv: string[] } : null,
+    remove: () => fs.rmSync(directory, { recursive: true, force: true }),
+  }
 }
 
 export function removeFixture(root: string): void {
