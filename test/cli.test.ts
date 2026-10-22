@@ -5,7 +5,7 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { RULES } from '../src/rules.js'
-import { makeAppFixture, removeFixture } from './fixture.js'
+import { makeAppFixture, makeMonorepoFixture, removeFixture } from './fixture.js'
 
 const repositoryRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const cli = path.join(repositoryRoot, 'src', 'cli.ts')
@@ -16,6 +16,30 @@ function run(args: string[]) {
     encoding: 'utf8',
   })
 }
+
+test('always rejects monorepo targets before rendering or saving reports', () => {
+  const root = makeMonorepoFixture()
+  try {
+    for (const format of ['terminal', 'markdown', 'json']) {
+      const result = run(['scan', path.join(root, 'apps/mercato/src'), '--format', format, '--fail-on', 'never'])
+      assert.equal(result.status, 2)
+      assert.equal(result.stdout, '')
+      assert.match(result.stderr, /\[runtime-standalone-application\]/)
+      assert.match(result.stderr, /monorepo is not a valid way to start a production app/)
+      assert.match(result.stderr, /create-mercato-app/)
+      assert.equal(result.stderr.includes(root), false)
+    }
+    const output = path.join(root, 'reports')
+    const saved = run([root, '--output', path.join(output, 'primary.md'),
+      '--markdown', path.join(output, 'readiness.md'), '--json', path.join(output, 'readiness.json')])
+    assert.equal(saved.status, 2)
+    assert.equal(saved.stdout, '')
+    assert.match(saved.stderr, /create-mercato-app/)
+    assert.equal(fs.existsSync(output), false)
+  } finally {
+    removeFixture(root)
+  }
+})
 
 test('keeps terminal output while saving Markdown and JSON reports', () => {
   const root = makeAppFixture()

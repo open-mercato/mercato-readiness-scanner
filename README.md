@@ -55,6 +55,15 @@ The scanner recognizes a generated Open Mercato app by its
 local configuration and documentation surfaces. It never runs target scripts,
 loads the application, contacts its services, or performs network probes.
 
+The Open Mercato framework monorepo is rejected with exit code 2, including when
+scanning from its internal app, a package, or another subdirectory. A monorepo is
+not a valid way to start a production app: create a standalone application with
+`create-mercato-app` and scan that application instead. The
+[`runtime-standalone-application`](docs/rules/runtime-standalone-application.md)
+target guard runs before readiness checks or report output, regardless of
+`--fail-on` or report format. Generated applications in unrelated workspaces
+remain supported.
+
 Live `.env*` files are never opened. Git is queried only for tracked path names
 so the scanner can report a committed live environment file without reading its
 contents. Repository hooks, filesystem monitors, and optional Git locks are
