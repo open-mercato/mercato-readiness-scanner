@@ -67,7 +67,7 @@ remediation text and a permanent rule-documentation URL.
 Credential inspection runs automatically in every scan:
 
 ```bash
-npx mercato-readiness-scanner@0.2.1 scan . --fail-on high
+npx mercato-readiness-scanner@0.2.2 scan . --fail-on high
 ```
 
 `scan` inspects root `.env`, `.env.production`, `.env.local`, and
@@ -135,7 +135,7 @@ Pin the scanner version and fail the job on high or critical findings while
 saving a JSON report:
 
 ```bash
-npx --yes mercato-readiness-scanner@0.2.1 scan . --json readiness.json --fail-on high
+npx --yes mercato-readiness-scanner@0.2.2 scan . --json readiness.json --fail-on high
 ```
 
 `--fail-on` accepts `critical`, `high`, `medium`, `low`, or `never` (the default).
@@ -158,20 +158,21 @@ verification. Reports are rendered or saved before the exit threshold is applied
 Start in a clean Git working tree, then preview the changes:
 
 ```bash
-npx mercato-readiness-scanner@0.2.1 apply . --dry-run
+npx mercato-readiness-scanner@0.2.2 apply . --dry-run
 ```
 
 Apply the safe changes, review the tracked diff and any newly created files,
 then scan again:
 
 ```bash
-npx mercato-readiness-scanner@0.2.1 apply . --yes
+npx mercato-readiness-scanner@0.2.2 apply . --yes
 git status --short
 git diff
-npx mercato-readiness-scanner@0.2.1 scan . --fail-on high
+npx mercato-readiness-scanner@0.2.2 scan . --fail-on high
 ```
 
-`apply` can add missing ignore patterns, build/start scripts, and runbook stubs.
+`apply` uses 🔧 for proposed fixes, ✅ for completed changes, and ⏭️ for skipped
+items. It can add missing ignore patterns, build/start scripts, and runbook stubs.
 Credential rotation, encryption keys, KMS provisioning, and existing deployment
 configuration require manual changes. The final scan can therefore still report
 failures after all safe fixes have been applied. Runbook stubs require operator

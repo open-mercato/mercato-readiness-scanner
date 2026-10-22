@@ -1,6 +1,6 @@
 {
   "name": "mercato-readiness-scanner",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Static production-readiness scanner for Open Mercato applications.",
   "type": "module",
   "bin": {

@@ -78,10 +78,10 @@ export function formatJson(report: ScanReport): string {
 /** Renders the confirmation preview shown before anything is written. */
 export function formatApplyPlan(plan: ApplyPlan, color = true): string {
   const colors = colorizer(color)
-  const lines = [colors.bold('Safe policies to apply'), '']
+  const lines = [colors.bold('Proposed safe fixes'), '']
   if (!plan.planned.length) lines.push('   Nothing to apply: no failing rule has a safe, purely additive fix left.')
   for (const fix of plan.planned) {
-    lines.push(`${ICONS.fail} ${colors.bold(fix.title)} ${colors.dim(`[${fix.id} · ${fix.severity}]`)}`)
+    lines.push(`🔧 ${colors.bold(fix.title)} ${colors.dim(`[${fix.id} · ${fix.severity}]`)}`)
     for (const action of fix.actions) lines.push(`   + ${action.description}`)
   }
   if (plan.skipped.length) {
@@ -103,7 +103,7 @@ export function formatApplyOutcome(outcome: ApplyOutcome, color = true): string 
   ]
   if (!outcome.changes.length) lines.push('   Nothing to do: every safely fixable rule is already satisfied.')
   for (const change of outcome.changes) {
-    const marker = outcome.dryRun ? '+ ' : change.changed ? ICONS.pass : ICONS.skipped
+    const marker = outcome.dryRun ? '🔧' : change.changed ? ICONS.pass : ICONS.skipped
     lines.push(`${marker} ${change.description} ${colors.dim(`[${change.id}${change.path ? ` · ${change.path}` : ''}]`)}`)
     if (change.note && !outcome.dryRun) lines.push(colors.dim(`   ${change.note}`))
   }
