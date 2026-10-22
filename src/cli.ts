@@ -25,8 +25,8 @@ class CliUsageError extends Error {
 const HELP = `Open Mercato production-readiness scanner
 
 Usage:
-  mercato-readiness scan [path] [options]
-  mercato-readiness [path] [options]
+  mercato-readiness-scanner scan [path] [options]
+  mercato-readiness-scanner [path] [options]
 
 Options:
   --format <terminal|markdown|json>  stdout format (default: terminal)
@@ -42,9 +42,9 @@ Options:
   --version                         show version
 
 Examples:
-  mercato-readiness scan .
-  mercato-readiness scan . --markdown readiness.md --json readiness.json
-  mercato-readiness scan . --format json --output readiness.json --fail-on high
+  mercato-readiness-scanner scan .
+  mercato-readiness-scanner scan . --markdown readiness.md --json readiness.json
+  mercato-readiness-scanner scan . --format json --output readiness.json --fail-on high
 `
 
 function takeValue(args: string[], index: number, flag: string, allowDash = false): string {
